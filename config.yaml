@@ -1,0 +1,54 @@
+server:
+  port: ${PORT:8080}
+  read_timeout: 10s
+  write_timeout: 10s
+  graceful_shutdown: ${GRACEFUL_SHUTDOWN_SECONDS:15}s
+
+chatwoot:
+  admin_api_url: ${CHATWOOT_ADMIN_API_URL}
+  internal_url: ${CHATWOOT_INTERNAL_URL}
+  admin_email: ${CHATWOOT_ADMIN_EMAIL}
+  admin_password: ${CHATWOOT_ADMIN_PASSWORD}
+  webhook_base: ${CHATWOOT_WEBHOOK_BASE}
+
+evolution:
+  base_url: ${EVOLUTION_BASE_URL}
+  api_key: ${EVOLUTION_API_KEY}
+  default_instance: ${EVOLUTION_INSTANCE}
+
+database:
+  url: ${DATABASE_URL}
+  pool:
+    max_conns: ${DB_POOL_MAX_CONNS:20}
+    min_conns: ${DB_POOL_MIN_CONNS:5}
+
+queue:
+  workers: ${QUEUE_WORKERS:10}
+  max_retries: ${QUEUE_MAX_RETRIES:3}
+  retry_delay: ${QUEUE_RETRY_DELAY_MS:1000}ms
+  worker_concurrency: 5
+
+circuit_breaker:
+  timeout: ${CB_TIMEOUT_SECONDS:30}s
+  max_requests: ${CB_MAX_REQUESTS:5}
+  failure_threshold: ${CB_FAILURE_THRESHOLD:0.5}
+
+templates:
+  welcome_contact: "Olá, {{.Name}}! Seu contato foi criado. Protocolo: {{.Protocol}}"
+  ticket_opened: "Seu atendimento {{.Protocol}} foi aberto. Aguarde nosso retorno!"
+  ticket_closed: "Atendimento {{.Protocol}} encerrado. Como foi sua experiência?"
+  sla_alert: "[Alerta Interno] SLA do ticket {{.TicketID}} vence em {{.Minutes}} min."
+
+policy:
+  delay_min_ms: 3000
+  delay_max_ms: 8000
+  default_max_messages_per_day: 100
+  warmup_days: 7
+  warmup_max_messages_per_day: 40
+  recipient_cooldown_seconds: 300
+  tenant_rate_limit: 60
+
+callbacks:
+  directus_webhook_url: ${DIRECTUS_WEBHOOK_URL:""}
+  directus_webhook_secret: ${DIRECTUS_WEBHOOK_SECRET:""}
+  enabled: ${CALLBACKS_ENABLED:false}

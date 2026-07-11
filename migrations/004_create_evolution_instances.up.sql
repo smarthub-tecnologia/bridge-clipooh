@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS evolution_instances (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    instance_id VARCHAR(255) NOT NULL,
+    instance_name VARCHAR(255) NOT NULL,
+    api_key TEXT,
+    base_url VARCHAR(255),
+    status VARCHAR(50) DEFAULT 'created',
+    qr_code TEXT,
+    phone_number VARCHAR(50),
+    webhook_url TEXT,
+    webhook_events JSONB,
+    last_connection TIMESTAMP WITH TIME ZONE,
+    messages_sent INT DEFAULT 0,
+    messages_received INT DEFAULT 0,
+    config JSONB,
+    metadata JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);

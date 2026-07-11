@@ -1,0 +1,30 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+wa-bridge
+server
+bridge
+
+# Build output
+/dist/
+/bin/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+
+# Go tooling
+*.test
+*.out
+/vendor/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

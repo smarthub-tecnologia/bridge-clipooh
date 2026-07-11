@@ -1,0 +1,1 @@
+-- No rollback — plan/usage data migrated to Directus

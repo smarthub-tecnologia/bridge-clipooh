@@ -1,0 +1,2 @@
+ALTER TABLE chatwoot_inboxes
+  DROP CONSTRAINT IF EXISTS chatwoot_inboxes_chatwoot_account_id_inbox_id_unique;
