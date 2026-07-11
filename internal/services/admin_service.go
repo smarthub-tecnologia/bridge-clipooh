@@ -17,33 +17,36 @@ import (
 )
 
 type AdminService struct {
-	db              *pgxpool.Pool
-	tenantRepo      repository.TenantRepository
-	instanceRepo    repository.InstanceRepository
-	inboxRepo       *repository.InboxRepository
-	chatwootAdmin   *ChatwootAdminClient
-	evolution       *EvolutionClient
-	webhookBaseURL  string
-	callbackService *CallbackService
+	db               *pgxpool.Pool
+	tenantRepo       repository.TenantRepository
+	instanceRepo     repository.InstanceRepository
+	inboxRepo        *repository.InboxRepository
+	chatwootUserRepo *repository.ChatwootUserRepository
+	chatwootAdmin    *ChatwootAdminClient
+	evolution        *EvolutionClient
+	webhookBaseURL   string
+	callbackService  *CallbackService
 }
 
 func NewAdminService(
 	tenantRepo repository.TenantRepository,
 	instanceRepo repository.InstanceRepository,
 	inboxRepo *repository.InboxRepository,
+	chatwootUserRepo *repository.ChatwootUserRepository,
 	db *pgxpool.Pool,
 	chatwootAdmin *ChatwootAdminClient,
 	evolution *EvolutionClient,
 	webhookBaseURL string,
 ) *AdminService {
 	return &AdminService{
-		db:             db,
-		tenantRepo:     tenantRepo,
-		instanceRepo:   instanceRepo,
-		inboxRepo:      inboxRepo,
-		chatwootAdmin:  chatwootAdmin,
-		evolution:      evolution,
-		webhookBaseURL: webhookBaseURL,
+		db:               db,
+		tenantRepo:       tenantRepo,
+		instanceRepo:     instanceRepo,
+		inboxRepo:        inboxRepo,
+		chatwootUserRepo: chatwootUserRepo,
+		chatwootAdmin:    chatwootAdmin,
+		evolution:        evolution,
+		webhookBaseURL:   webhookBaseURL,
 	}
 }
 
@@ -122,8 +125,33 @@ func (s *AdminService) CreateTenant(ctx context.Context, req CreateTenantRequest
 		}
 		user, err = s.chatwootAdmin.CreateUser(ctx, userReq)
 		if err != nil {
-			// Usuário já existe (422) ou outro erro — token será obtido via GetAccountAccessToken abaixo
+			// Usuário já existe (422) ou outro erro — token será obtido via GetAccountAccessToken abaixo.
+			// Sem o ID desse usuário não dá pra vinculá-lo à conta nova (a Platform
+			// API do Chatwoot não tem endpoint de busca por e-mail) — por isso
+			// consultamos o cache local (chatwoot_users) alimentado em provisões
+			// anteriores que criaram esse mesmo e-mail com sucesso.
 			logger.Warn("could not create chatwoot user (possibly already exists), will fetch token", zap.Error(err))
+
+			if s.chatwootUserRepo != nil {
+				cachedID, found, cacheErr := s.chatwootUserRepo.GetByEmail(ctx, req.AdminEmail)
+				if cacheErr != nil {
+					logger.Warn("failed to query chatwoot_users cache", zap.Error(cacheErr))
+				} else if found {
+					existingUser := &models.ChatwootCreateUserResponse{
+						ID:       cachedID,
+						Email:    req.AdminEmail,
+						Accounts: []models.ChatwootUserAccountRef{{}}, // não-vazio: marca usuário pré-existente pro guard de rollback
+					}
+					if linkErr := s.linkOrRollbackAgent(ctx, account.ID, existingUser, "administrator"); linkErr != nil {
+						logger.Warn("failed to link cached user to account", zap.Error(linkErr))
+					} else {
+						logger.Info("linked pre-existing chatwoot user via local cache", zap.Int("user_id", cachedID))
+					}
+				} else {
+					logger.Warn("no chatwoot_users cache entry for this email — admin will need to be added to the account manually",
+						zap.String("email", req.AdminEmail))
+				}
+			}
 		} else {
 			logger.Info("chatwoot user created", zap.Int("user_id", user.ID))
 			if chatwootAccessToken == "" && user.AccessToken != "" {
@@ -139,6 +167,13 @@ func (s *AdminService) CreateTenant(ctx context.Context, req CreateTenantRequest
 			// admin, que pode ser refeito manualmente depois).
 			if err := s.linkOrRollbackAgent(ctx, account.ID, user, "administrator"); err != nil {
 				logger.Warn("failed to link user to account, possibly already linked", zap.Error(err))
+			}
+
+			// Alimenta o cache pra próximas provisões que reusarem este e-mail.
+			if s.chatwootUserRepo != nil {
+				if cacheErr := s.chatwootUserRepo.Upsert(ctx, req.AdminEmail, user.ID); cacheErr != nil {
+					logger.Warn("failed to cache chatwoot user id (non-fatal)", zap.Error(cacheErr))
+				}
 			}
 		}
 

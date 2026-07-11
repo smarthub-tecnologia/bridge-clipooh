@@ -4,9 +4,9 @@
 *.dll
 *.so
 *.dylib
-wa-bridge
-server
-bridge
+/wa-bridge
+/server
+/bridge
 
 # Build output
 /dist/

@@ -99,6 +99,7 @@ func main() {
 	instanceRepo := repository.NewInstanceRepository(pool)
 	inboxRepo := repository.NewInboxRepository(pool)
 	eventRepo := repository.NewAddonEventRepository(pool)
+	chatwootUserRepo := repository.NewChatwootUserRepository(pool)
 
 	// Clientes externos
 	evolutionClient := services.NewEvolutionClient(
@@ -128,6 +129,7 @@ func main() {
 		tenantRepo,
 		instanceRepo,
 		inboxRepo,
+		chatwootUserRepo,
 		pool,
 		chatwootAdmin,
 		evolutionClient,
