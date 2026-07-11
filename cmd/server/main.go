@@ -78,29 +78,10 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Conexão com banco do Directus (opcional)
-	directusPool, err := config.NewDirectusDatabasePool(ctx)
-	if err != nil {
-		logger.Warn("failed to connect to directus database, addon_events will not be recorded", zap.Error(err))
-	} else {
-		defer directusPool.Close()
-	}
-
-	// Conexão com Supabase (opcional — meta_provider_configs).
-	// Quando presente, GetMetaConfig usa SQL direto em vez da REST do Directus.
-	// Se SUPABASE_DATABASE_URL estiver ausente, o Bridge usa Directus REST como fallback.
-	if os.Getenv("SUPABASE_DATABASE_URL") != "" {
-		supabasePool, spErr := config.NewSupabaseDatabasePool(ctx)
-		if spErr != nil {
-			logger.Warn("failed to connect to supabase, metaconfig will use directus rest",
-				zap.Error(spErr),
-			)
-		} else {
-			defer supabasePool.Close()
-			metaconfig.SetSupabasePool(supabasePool)
-			logger.Info("metaconfig: supabase pool active, using direct SQL for meta_provider_configs")
-		}
-	}
+	// addon_events e meta_provider_configs vivem no Postgres próprio do bridge
+	// (migrations 014/015) — não há mais dependência de DIRECTUS_DATABASE_URL
+	// nem SUPABASE_DATABASE_URL.
+	metaconfig.SetPool(pool)
 
 	// Roda as migrações (se DATABASE_URL não vier da config, pode pegar do env)
 	dbURL := os.Getenv("DATABASE_URL")
@@ -117,7 +98,7 @@ func main() {
 	tenantRepo := repository.NewTenantRepository(pool)
 	instanceRepo := repository.NewInstanceRepository(pool)
 	inboxRepo := repository.NewInboxRepository(pool)
-	eventRepo := repository.NewAddonEventRepository(directusPool)
+	eventRepo := repository.NewAddonEventRepository(pool)
 
 	// Clientes externos
 	evolutionClient := services.NewEvolutionClient(

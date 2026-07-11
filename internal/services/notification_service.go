@@ -103,6 +103,7 @@ func (s *NotificationService) SendMessage(ctx context.Context, req models.SendMe
 		instance, err := s.instanceRepo.FindDefaultByTenantID(ctx, "")
 		if err == nil && instance != nil {
 			tenantID = instance.TenantID
+			instanceName = instance.InstanceName
 			req.Instance = instance.InstanceName // normalize
 		}
 	} else {
@@ -121,7 +122,7 @@ func (s *NotificationService) SendMessage(ctx context.Context, req models.SendMe
 	}
 
 	for _, to := range req.To {
-		resp, err := s.notifRepo.Create(ctx, tenantID, idempotencyKey, to, req.Type, content, externalID)
+		resp, err := s.notifRepo.Create(ctx, tenantID, idempotencyKey, to, req.Type, content, externalID, instanceName)
 		if err != nil {
 			return nil, err
 		}

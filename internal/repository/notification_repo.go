@@ -19,16 +19,18 @@ func NewNotificationRepository(pool *pgxpool.Pool) *NotificationRepository {
 
 // externalID, quando não vazio, é usado como o id da notificação em vez de um
 // UUID gerado aqui — permite ao caller (Next.js) correlacionar a resposta
-// assíncrona (callback) sem depender de um ID que só a Bridge conhece.
-func (r *NotificationRepository) Create(ctx context.Context, tenantID, idempotencyKey, to, msgType string, content json.RawMessage, externalID string) (*models.NotificationResponse, error) {
+// assíncrona (callback) sem depender de um ID que só a Bridge conhece. É
+// também o "event_id" usado por pkg/metaconfig.LookupEventIDByPhone pra
+// correlacionar callbacks de entrega da Meta Cloud API.
+func (r *NotificationRepository) Create(ctx context.Context, tenantID, idempotencyKey, to, msgType string, content json.RawMessage, externalID, instanceName string) (*models.NotificationResponse, error) {
 	id := externalID
 	if id == "" {
 		id = uuid.New().String()
 	}
 	_, err := r.pool.Exec(ctx, `
-        INSERT INTO notifications (id, tenant_id, idempotency_key, to_number, type, content, status, created_at)
-        VALUES ($1, NULLIF($2, '')::UUID, $3, $4, $5, $6, 'queued', NOW())
-    `, id, tenantID, idempotencyKey, to, msgType, content)
+        INSERT INTO notifications (id, tenant_id, idempotency_key, to_number, type, content, status, instance_name, created_at)
+        VALUES ($1, NULLIF($2, '')::UUID, $3, $4, $5, $6, 'queued', $7, NOW())
+    `, id, tenantID, idempotencyKey, to, msgType, content, instanceName)
 	if err != nil {
 		return nil, err
 	}
