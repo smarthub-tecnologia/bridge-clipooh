@@ -30,7 +30,6 @@ type QueueJobPayload struct {
 }
 
 type NotificationService struct {
-	tenantRepo      repository.TenantRepository
 	instanceRepo    repository.InstanceRepository
 	notifRepo       *repository.NotificationRepository
 	evolutionClient *EvolutionClient
@@ -38,30 +37,25 @@ type NotificationService struct {
 	circuitBreaker  CircuitBreaker
 	idempotency     *IdempotencyService
 	limiter         *InstanceLimiter
-	callbacks       *CallbackService
 	config          config.PolicyConfig
 	queue           *queue.RedisQueue
 }
 
 func NewNotificationService(
-	tenantRepo repository.TenantRepository,
 	instanceRepo repository.InstanceRepository,
 	notifRepo *repository.NotificationRepository,
 	evolutionClient *EvolutionClient,
 	templates map[string]string,
 	limiter *InstanceLimiter,
-	callbacks *CallbackService,
 	cfg config.PolicyConfig,
 	q *queue.RedisQueue,
 ) *NotificationService {
 	return &NotificationService{
-		tenantRepo:      tenantRepo,
 		instanceRepo:    instanceRepo,
 		notifRepo:       notifRepo,
 		evolutionClient: evolutionClient,
 		templates:       templates,
 		limiter:         limiter,
-		callbacks:       callbacks,
 		config:          cfg,
 		queue:           q,
 	}
@@ -97,18 +91,12 @@ func (s *NotificationService) SendMessage(ctx context.Context, req models.SendMe
 		return nil, fmt.Errorf("no recipients specified")
 	}
 
-	instanceName := req.Instance
-	var tenantID string
-	if instanceName == "" {
-		instance, err := s.instanceRepo.FindDefaultByTenantID(ctx, "")
-		if err == nil && instance != nil {
-			tenantID = instance.TenantID
-			instanceName = instance.InstanceName
+	if req.Instance == "" {
+		if instance, err := s.instanceRepo.FindDefault(ctx); err == nil && instance != nil {
 			req.Instance = instance.InstanceName // normalize
 		}
-	} else {
-		tenantID, _ = s.instanceRepo.GetTenantIDByInstance(ctx, instanceName)
 	}
+	instanceName := req.Instance
 
 	var responses []models.NotificationResponse
 	content, _ := json.Marshal(req)
@@ -122,7 +110,7 @@ func (s *NotificationService) SendMessage(ctx context.Context, req models.SendMe
 	}
 
 	for _, to := range req.To {
-		resp, err := s.notifRepo.Create(ctx, tenantID, idempotencyKey, to, req.Type, content, externalID, instanceName)
+		resp, err := s.notifRepo.Create(ctx, idempotencyKey, to, req.Type, content, externalID, instanceName)
 		if err != nil {
 			return nil, err
 		}
@@ -148,7 +136,7 @@ func (s *NotificationService) SendMessage(ctx context.Context, req models.SendMe
 
 		if s.queue != nil {
 			if err := s.queue.Enqueue(ctx, job); err != nil {
-				s.failWithStatus(ctx, resp.NotificationID, tenantID, req.Instance, StatusFailed, err.Error())
+				s.failWithStatus(ctx, resp.NotificationID, req.Instance, StatusFailed, err.Error())
 			}
 		} else {
 			// Se a fila não foi injetada (testes), processa sincronicamente
@@ -158,30 +146,8 @@ func (s *NotificationService) SendMessage(ctx context.Context, req models.SendMe
 	return responses, nil
 }
 
-func statusToEventType(status string) string {
-	switch status {
-	case StatusBlockedCooldown, StatusBlockedRateLimit:
-		return "notification.blocked_rate"
-	case StatusBlockedCircuitBreaker, StatusFailed:
-		return "notification.blocked_plan"
-	default:
-		return "notification.blocked_plan"
-	}
-}
-
-func (s *NotificationService) failWithStatus(ctx context.Context, logID, tenantID, instanceName, status, errMsg string) {
+func (s *NotificationService) failWithStatus(ctx context.Context, logID, instanceName, status, errMsg string) {
 	s.notifRepo.UpdateStatus(ctx, logID, status, "", errMsg)
-	if s.callbacks != nil {
-		go s.callbacks.Notify(context.Background(), CallbackPayload{
-			EventType:    statusToEventType(status),
-			LogID:        logID,
-			TenantID:     tenantID,
-			InstanceName: instanceName,
-			Status:       status,
-			Error:        errMsg,
-			SentAt:       time.Now(),
-		})
-	}
 }
 
 // ProcessSendMessage é invocado pelo Worker do Redis
@@ -191,26 +157,24 @@ func (s *NotificationService) ProcessSendMessage(ctx context.Context, req models
 	if len(req.To) == 0 {
 		err := fmt.Errorf("no recipient")
 		logger.Error("process_send_message failed", zap.Error(err))
-		s.failWithStatus(ctx, logID, "", req.Instance, StatusFailed, err.Error())
+		s.failWithStatus(ctx, logID, req.Instance, StatusFailed, err.Error())
 		return fmt.Errorf("%w: %v", queue.ErrDiscardJob, err)
 	}
 	to := req.To[0]
 
 	instanceName := req.Instance
 	var instanceToken string
-	var tenantID string
 	var connectedAt *time.Time
 
 	if instanceName == "" {
-		instance, err := s.instanceRepo.FindDefaultByTenantID(ctx, "")
+		instance, err := s.instanceRepo.FindDefault(ctx)
 		if err != nil {
 			err = fmt.Errorf("no default instance: %w", err)
 			logger.Error("process_send_message failed", zap.Error(err))
-			s.failWithStatus(ctx, logID, "", "", StatusFailed, err.Error())
+			s.failWithStatus(ctx, logID, "", StatusFailed, err.Error())
 			return fmt.Errorf("%w: %v", queue.ErrDiscardJob, err)
 		}
 		instanceName = instance.InstanceName
-		tenantID = instance.TenantID
 		connectedAt = instance.ConnectedAt
 		if instance.APIKey != nil {
 			instanceToken = *instance.APIKey
@@ -218,7 +182,6 @@ func (s *NotificationService) ProcessSendMessage(ctx context.Context, req models
 	} else {
 		instance, err := s.instanceRepo.FindByInstanceName(ctx, instanceName)
 		if err == nil && instance != nil {
-			tenantID = instance.TenantID
 			connectedAt = instance.ConnectedAt
 			if instance.APIKey != nil {
 				instanceToken = *instance.APIKey
@@ -226,8 +189,7 @@ func (s *NotificationService) ProcessSendMessage(ctx context.Context, req models
 		} else {
 			err = fmt.Errorf("instance not found: %s", instanceName)
 			logger.Error("process_send_message failed", zap.Error(err))
-			// tenantID is unknown here, so we pass empty string, but logID and instanceName are preserved
-			s.failWithStatus(ctx, logID, "", instanceName, StatusFailed, err.Error())
+			s.failWithStatus(ctx, logID, instanceName, StatusFailed, err.Error())
 			return fmt.Errorf("%w: %v", queue.ErrDiscardJob, err)
 		}
 	}
@@ -241,20 +203,20 @@ func (s *NotificationService) ProcessSendMessage(ctx context.Context, req models
 	if s.limiter != nil {
 		if allowed, err := s.limiter.AllowRecipientSend(ctx, instanceName, to); err != nil || !allowed {
 			logger.Error("process_send_message failed", zap.Error(ErrCooldownActive))
-			s.failWithStatus(ctx, logID, tenantID, instanceName, StatusBlockedCooldown, ErrCooldownActive.Error())
+			s.failWithStatus(ctx, logID, instanceName, StatusBlockedCooldown, ErrCooldownActive.Error())
 			return fmt.Errorf("%w: %v", queue.ErrDiscardJob, ErrCooldownActive)
 		}
 
 		if allowed, err := s.limiter.AllowInstanceSend(ctx, instanceName, *connectedAt); err != nil || !allowed {
 			logger.Error("process_send_message failed", zap.Error(ErrRateLimitExceeded))
-			s.failWithStatus(ctx, logID, tenantID, instanceName, StatusBlockedRateLimit, ErrRateLimitExceeded.Error())
+			s.failWithStatus(ctx, logID, instanceName, StatusBlockedRateLimit, ErrRateLimitExceeded.Error())
 			return fmt.Errorf("%w: %v", queue.ErrDiscardJob, ErrRateLimitExceeded)
 		}
 	}
 
 	if s.circuitBreaker != nil && !s.circuitBreaker.Allow() {
 		logger.Error("process_send_message failed", zap.Error(ErrCircuitBreakerOpen))
-		s.failWithStatus(ctx, logID, tenantID, instanceName, StatusBlockedCircuitBreaker, ErrCircuitBreakerOpen.Error())
+		s.failWithStatus(ctx, logID, instanceName, StatusBlockedCircuitBreaker, ErrCircuitBreakerOpen.Error())
 		return fmt.Errorf("%w: %v", queue.ErrDiscardJob, ErrCircuitBreakerOpen)
 	}
 
@@ -286,7 +248,7 @@ func (s *NotificationService) ProcessSendMessage(ctx context.Context, req models
 			s.circuitBreaker.Failure()
 		}
 		logger.Error("failed to send message", zap.Error(sendErr), zap.String("to", to))
-		s.failWithStatus(ctx, logID, tenantID, instanceName, StatusFailed, sendErr.Error())
+		s.failWithStatus(ctx, logID, instanceName, StatusFailed, sendErr.Error())
 		return sendErr
 	}
 
@@ -295,18 +257,6 @@ func (s *NotificationService) ProcessSendMessage(ctx context.Context, req models
 	}
 
 	s.notifRepo.UpdateStatus(ctx, logID, StatusSent, result.MessageID, "")
-	if s.callbacks != nil {
-		go s.callbacks.Notify(context.Background(), CallbackPayload{
-			EventType:    "notification.sent",
-			LogID:        logID,
-			TenantID:     tenantID,
-			InstanceName: instanceName,
-			Status:       StatusSent,
-			PhoneNumber:  to,
-			MsgID:        result.MessageID,
-			SentAt:       time.Now(),
-		})
-	}
 
 	return nil
 }

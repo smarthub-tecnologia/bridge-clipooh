@@ -36,23 +36,15 @@ func (h *ChatwootHandler) HandleWebhook(w http.ResponseWriter, r *http.Request) 
 		zap.String("method", r.Method),
 		zap.String("remote_addr", r.RemoteAddr),
 		zap.Bool("has_signature", r.Header.Get("X-Chatwoot-Signature") != ""),
-		zap.Bool("has_tenant", r.URL.Query().Get("tenant") != ""),
 	)
 
-	// Lê tenant da query string
-	tenantID := r.URL.Query().Get("tenant")
-	if tenantID == "" {
-		logger.Warn("missing tenant query param")
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Valida segredo do webhook contra o segredo salvo no banco do tenant
-	if !h.bridgeService.ValidateChatwootWebhookSecret(ctx, tenantID, r) {
+	// Valida segredo do webhook contra CHATWOOT_WEBHOOK_SECRET (fixo — só há
+	// uma conta Chatwoot, não há mais ?tenant= na URL).
+	if !h.bridgeService.ValidateChatwootWebhookSecret(r) {
 		if h.metrics != nil {
 			h.metrics.Error401Count.Add(1)
 		}
-		logger.Warn("invalid chatwoot token", zap.String("tenant", tenantID))
+		logger.Warn("invalid chatwoot webhook secret")
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -64,9 +56,7 @@ func (h *ChatwootHandler) HandleWebhook(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Rastreio de IDs — cruza tenant da query param com account_id real do payload
 	logger.Info("DEBUG: Chatwoot Account ID Trace",
-		zap.String("tenant_query_param", tenantID),
 		zap.Int("payload_account_id", webhook.Account.ID),
 		zap.Int("payload_conversation_id", webhook.Conversation.ID),
 		zap.String("event", webhook.Event),

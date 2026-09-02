@@ -35,27 +35,3 @@ func (rl *RateLimiter) LimitByIP(limit int, window time.Duration) func(http.Hand
 	}
 }
 
-func (rl *RateLimiter) LimitByTenant(limit int, window time.Duration) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tenantID := r.Header.Get("X-Tenant-ID")
-			if tenantID == "" {
-				zap.L().Warn("X-Tenant-ID missing in request, bypassing tenant rate limit", zap.String("path", r.URL.Path))
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			key := "rate:tenant:" + tenantID
-			count, _ := rl.client.Incr(r.Context(), key).Result()
-			if count == 1 {
-				rl.client.Expire(r.Context(), key, window)
-			}
-			if count > int64(limit) {
-				zap.L().Warn("tenant rate limit exceeded", zap.String("tenant", tenantID))
-				http.Error(w, `{"error":"tenant rate limit exceeded","code":"TOO_MANY_REQUESTS"}`, http.StatusTooManyRequests)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-}

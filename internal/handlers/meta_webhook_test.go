@@ -9,7 +9,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -34,6 +33,18 @@ func signedRequest(body string) *http.Request {
 	r := httptest.NewRequest(http.MethodPost, "/api/v1/meta/webhook", strings.NewReader(body))
 	r.Header.Set("X-Hub-Signature-256", metaSig(body, testMetaAppSecret))
 	return r
+}
+
+// withHookSync arms afterMetaWebhookEvent for the duration of fn, returning a
+// channel closed once processMetaEvent's fire-and-forget goroutine finishes.
+func withHookSync(t *testing.T, fn func()) {
+	t.Helper()
+	done, signal := waitOnce()
+	prev := afterMetaWebhookEvent
+	afterMetaWebhookEvent = signal
+	defer func() { afterMetaWebhookEvent = prev }()
+	fn()
+	waitFor(t, done)
 }
 
 func TestMetaWebhook_VerifySuccess(t *testing.T) {
@@ -80,14 +91,7 @@ func TestMetaWebhook_DeliveredEvent(t *testing.T) {
 	}
 	defer func() { getInstanceIDByPhoneNumberIDFn = prev }()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	t.Setenv("META_APP_SECRET", testMetaAppSecret)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
 
 	payload := `{
 		"entry": [{
@@ -107,23 +111,22 @@ func TestMetaWebhook_DeliveredEvent(t *testing.T) {
 	h := NewMetaWebhookHandler()
 	w := httptest.NewRecorder()
 	r := signedRequest(payload)
-	h.HandleEvent(w, r)
+
+	logs := withObservedLogs(func() {
+		withHookSync(t, func() { h.HandleEvent(w, r) })
+	})
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for delivered callback")
+	entry := findLog(logs, "meta message status: delivered")
+	if entry == nil {
+		t.Fatal("expected a 'meta message status: delivered' log entry")
 	}
-
-	if captured["event"] != "delivered" {
-		t.Errorf("event = %v, want delivered", captured["event"])
-	}
-	if captured["event_id"] != "evt-del-001" {
-		t.Errorf("event_id = %v, want evt-del-001", captured["event_id"])
+	fields := entry.ContextMap()
+	if fields["event_id"] != "evt-del-001" {
+		t.Errorf("event_id = %v, want evt-del-001", fields["event_id"])
 	}
 }
 
@@ -136,14 +139,7 @@ func TestMetaWebhook_MessageReceived_Text(t *testing.T) {
 	lookupEventIDByPhoneFn = func(_, _ string) (string, bool, error) { return "evt-msg-001", true, nil }
 	defer func() { lookupEventIDByPhoneFn = prevLookup }()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	t.Setenv("META_APP_SECRET", testMetaAppSecret)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
 
 	payload := `{
 		"entry": [{
@@ -165,30 +161,28 @@ func TestMetaWebhook_MessageReceived_Text(t *testing.T) {
 	h := NewMetaWebhookHandler()
 	w := httptest.NewRecorder()
 	r := signedRequest(payload)
-	h.HandleEvent(w, r)
+
+	logs := withObservedLogs(func() {
+		withHookSync(t, func() { h.HandleEvent(w, r) })
+	})
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for message.received callback")
+	entry := findLog(logs, "meta message received")
+	if entry == nil {
+		t.Fatal("expected a 'meta message received' log entry")
 	}
-
-	if captured["event"] != "message.received" {
-		t.Errorf("event = %v, want message.received", captured["event"])
+	fields := entry.ContextMap()
+	if fields["event_id"] != "evt-msg-001" {
+		t.Errorf("event_id = %v, want evt-msg-001", fields["event_id"])
 	}
-	if captured["event_id"] != "evt-msg-001" {
-		t.Errorf("event_id = %v, want evt-msg-001", captured["event_id"])
+	if fields["message_type"] != "text" {
+		t.Errorf("message_type = %v, want text", fields["message_type"])
 	}
-	reply, _ := captured["reply"].(map[string]interface{})
-	if reply["message_type"] != "text" {
-		t.Errorf("reply.message_type = %v, want text", reply["message_type"])
-	}
-	if reply["text"] != "Oi, quero saber mais" {
-		t.Errorf("reply.text = %v, want 'Oi, quero saber mais'", reply["text"])
+	if fields["text"] != "Oi, quero saber mais" {
+		t.Errorf("text = %v, want 'Oi, quero saber mais'", fields["text"])
 	}
 }
 
@@ -201,14 +195,7 @@ func TestMetaWebhook_MessageReceived_NonText(t *testing.T) {
 	lookupEventIDByPhoneFn = func(_, _ string) (string, bool, error) { return "evt-msg-002", true, nil }
 	defer func() { lookupEventIDByPhoneFn = prevLookup }()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	t.Setenv("META_APP_SECRET", testMetaAppSecret)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
 
 	// Audio message — no "text" field in payload
 	payload := `{
@@ -230,24 +217,25 @@ func TestMetaWebhook_MessageReceived_NonText(t *testing.T) {
 	h := NewMetaWebhookHandler()
 	w := httptest.NewRecorder()
 	r := signedRequest(payload)
-	h.HandleEvent(w, r)
+
+	logs := withObservedLogs(func() {
+		withHookSync(t, func() { h.HandleEvent(w, r) })
+	})
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for message.received callback")
+	entry := findLog(logs, "meta message received")
+	if entry == nil {
+		t.Fatal("expected a 'meta message received' log entry")
 	}
-
-	reply, _ := captured["reply"].(map[string]interface{})
-	if reply["message_type"] != "audio" {
-		t.Errorf("reply.message_type = %v, want audio", reply["message_type"])
+	fields := entry.ContextMap()
+	if fields["message_type"] != "audio" {
+		t.Errorf("message_type = %v, want audio", fields["message_type"])
 	}
-	if reply["text"] != "" {
-		t.Errorf("reply.text = %v, want empty string for non-text message", reply["text"])
+	if fields["text"] != "" {
+		t.Errorf("text = %v, want empty string for non-text message", fields["text"])
 	}
 }
 
@@ -261,14 +249,7 @@ func TestMetaWebhook_MessageReceived_NullEventID(t *testing.T) {
 	lookupEventIDByPhoneFn = func(_, _ string) (string, bool, error) { return "", false, nil }
 	defer func() { lookupEventIDByPhoneFn = prevLookup }()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	t.Setenv("META_APP_SECRET", testMetaAppSecret)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
 
 	payload := `{
 		"entry": [{
@@ -290,25 +271,23 @@ func TestMetaWebhook_MessageReceived_NullEventID(t *testing.T) {
 	h := NewMetaWebhookHandler()
 	w := httptest.NewRecorder()
 	r := signedRequest(payload)
-	h.HandleEvent(w, r)
+
+	logs := withObservedLogs(func() {
+		withHookSync(t, func() { h.HandleEvent(w, r) })
+	})
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for message.received callback with null event_id")
+	entry := findLog(logs, "meta message received")
+	if entry == nil {
+		t.Fatal("expected a 'meta message received' log entry")
 	}
-
-	if captured["event"] != "message.received" {
-		t.Errorf("event = %v, want message.received", captured["event"])
-	}
-	// event_id must be null in JSON — json.Unmarshal into map[string]interface{}
-	// represents JSON null as nil.
-	if v, exists := captured["event_id"]; !exists || v != nil {
-		t.Errorf("event_id = %v, want null (nil)", v)
+	// event_id field must be absent when no wa_message_log match was found —
+	// mirrors the old callback's event_id:null, just as a missing log field.
+	if _, exists := entry.ContextMap()["event_id"]; exists {
+		t.Errorf("event_id should be absent when lookup found nothing, got %v", entry.ContextMap()["event_id"])
 	}
 }
 
@@ -319,16 +298,7 @@ func TestMetaWebhook_UnknownInstance(t *testing.T) {
 	}
 	defer func() { getInstanceIDByPhoneNumberIDFn = prev }()
 
-	callbackCalled := make(chan struct{}, 1)
-	cbSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		callbackCalled <- struct{}{}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer cbSrv.Close()
-
 	t.Setenv("META_APP_SECRET", testMetaAppSecret)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
 
 	payload := `{
 		"entry": [{
@@ -344,17 +314,17 @@ func TestMetaWebhook_UnknownInstance(t *testing.T) {
 	h := NewMetaWebhookHandler()
 	w := httptest.NewRecorder()
 	r := signedRequest(payload)
-	h.HandleEvent(w, r)
+
+	logs := withObservedLogs(func() {
+		withHookSync(t, func() { h.HandleEvent(w, r) })
+	})
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 
-	select {
-	case <-callbackCalled:
-		t.Error("callback should not be called for unknown instance")
-	case <-time.After(200 * time.Millisecond):
-		// correct — no callback dispatched
+	if entry := findLog(logs, "meta message status: delivered"); entry != nil {
+		t.Error("no status log should be emitted for an unknown instance")
 	}
 }
 
@@ -367,14 +337,7 @@ func TestMetaWebhook_SentStatus(t *testing.T) {
 	}
 	defer func() { getInstanceIDByPhoneNumberIDFn = prev }()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	t.Setenv("META_APP_SECRET", testMetaAppSecret)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
 
 	payload := `{
 		"entry": [{
@@ -398,29 +361,28 @@ func TestMetaWebhook_SentStatus(t *testing.T) {
 	h := NewMetaWebhookHandler()
 	w := httptest.NewRecorder()
 	r := signedRequest(payload)
-	h.HandleEvent(w, r)
+
+	logs := withObservedLogs(func() {
+		withHookSync(t, func() { h.HandleEvent(w, r) })
+	})
 
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for sent callback")
+	entry := findLog(logs, "meta message status: sent")
+	if entry == nil {
+		t.Fatal("expected a 'meta message status: sent' log entry")
 	}
-
-	if captured["event"] != "sent" {
-		t.Errorf("event = %v, want sent", captured["event"])
+	fields := entry.ContextMap()
+	if fields["event_id"] != "evt-sent-001" {
+		t.Errorf("event_id = %v, want evt-sent-001", fields["event_id"])
 	}
-	if captured["event_id"] != "evt-sent-001" {
-		t.Errorf("event_id = %v, want evt-sent-001", captured["event_id"])
+	if fields["conversation_id"] != "conv-abc123" {
+		t.Errorf("conversation_id = %v, want conv-abc123", fields["conversation_id"])
 	}
-	if captured["conversation_id"] != "conv-abc123" {
-		t.Errorf("conversation_id = %v, want conv-abc123", captured["conversation_id"])
-	}
-	if captured["conversation_origin"] != "marketing" {
-		t.Errorf("conversation_origin = %v, want marketing", captured["conversation_origin"])
+	if fields["conversation_origin"] != "marketing" {
+		t.Errorf("conversation_origin = %v, want marketing", fields["conversation_origin"])
 	}
 }
 
@@ -512,32 +474,5 @@ func TestUnixStringToISO8601(t *testing.T) {
 	// Fallback: non-numeric input returns as-is.
 	if unixStringToISO8601("not-a-ts") != "not-a-ts" {
 		t.Error("expected non-numeric input to be returned unchanged")
-	}
-}
-
-// Ensure JSON encoding of captured callbacks matches expected field names.
-func TestMetaDeliveredCallback_JSONFields(t *testing.T) {
-	cb := metaDeliveredCallback{
-		Event:         "delivered",
-		EventID:       "evt-001",
-		InstanceID:    "inst-001",
-		Timestamp:     "2024-05-06T00:00:00Z",
-		Provider:      "meta",
-		Wamid:         "wamid.abc",
-		PhoneNumberID: "1098",
-		DeliveredAt:   "2024-05-06T00:00:10Z",
-	}
-	b, err := json.Marshal(cb)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var m map[string]interface{}
-	if err := json.Unmarshal(b, &m); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	for _, key := range []string{"event", "event_id", "instance_id", "timestamp", "provider", "wamid", "phone_number_id", "delivered_at"} {
-		if _, ok := m[key]; !ok {
-			t.Errorf("missing JSON field: %s", key)
-		}
 	}
 }

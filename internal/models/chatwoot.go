@@ -4,7 +4,6 @@ import "time"
 
 type ChatwootInbox struct {
 	ID                string    `json:"id" db:"id"`
-	TenantID          string    `json:"tenant_id" db:"tenant_id"`
 	ChatwootAccountID int       `json:"chatwoot_account_id" db:"chatwoot_account_id"`
 	InboxID           int       `json:"inbox_id" db:"inbox_id"`
 	InboxName         string    `json:"inbox_name" db:"inbox_name"`

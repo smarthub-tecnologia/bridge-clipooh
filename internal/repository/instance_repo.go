@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,13 +15,11 @@ type InstanceRepository interface {
 	CreateTx(ctx context.Context, tx pgx.Tx, i *models.EvolutionInstance) error
 	FindByInstanceID(ctx context.Context, instanceID string) (*models.EvolutionInstance, error)
 	FindByInstanceName(ctx context.Context, instanceName string) (*models.EvolutionInstance, error)
-	FindDefaultByTenantID(ctx context.Context, tenantID string) (*models.EvolutionInstance, error)
+	FindDefault(ctx context.Context) (*models.EvolutionInstance, error)
 	FindAll(ctx context.Context) ([]models.EvolutionInstance, error)
 	UpdateStatus(ctx context.Context, instanceID, status string) error
 	Update(ctx context.Context, i *models.EvolutionInstance) error
-	GetTenantIDByInstance(ctx context.Context, instanceName string) (string, error)
 	GetConnectedAt(ctx context.Context, instanceName string) (*time.Time, error)
-	GetWorkspaceAndID(ctx context.Context, instanceName string) (workspaceID string, instanceID string, err error)
 	UpdateConnectionState(ctx context.Context, instanceName, state string, phone *string) error
 	LogoutInstance(ctx context.Context, instanceName string) error
 	DeleteInstance(ctx context.Context, instanceName string) error
@@ -34,17 +33,37 @@ func NewInstanceRepository(db *pgxpool.Pool) InstanceRepository {
 	return &instanceRepo{db: db}
 }
 
+const instanceSelectFields = `
+	id, instance_id, instance_name, api_key, base_url, status,
+	qr_code, phone_number, webhook_url, webhook_events,
+	connected_at, disconnected_at, disconnect_reason,
+	messages_sent, messages_received, config, metadata, created_at, updated_at`
+
+func scanInstance(row interface{ Scan(...any) error }) (*models.EvolutionInstance, error) {
+	var i models.EvolutionInstance
+	err := row.Scan(
+		&i.ID, &i.InstanceID, &i.InstanceName, &i.APIKey, &i.BaseURL, &i.Status,
+		&i.QRCode, &i.PhoneNumber, &i.WebhookURL, &i.WebhookEvents,
+		&i.ConnectedAt, &i.DisconnectedAt, &i.DisconnectReason,
+		&i.MessagesSent, &i.MessagesReceived, &i.Config, &i.Metadata, &i.CreatedAt, &i.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &i, nil
+}
+
 func (r *instanceRepo) Create(ctx context.Context, i *models.EvolutionInstance) error {
 	query := `
 		INSERT INTO evolution_instances (
-			tenant_id, instance_id, instance_name, api_key, base_url, status,
+			instance_id, instance_name, api_key, base_url, status,
 			qr_code, phone_number, webhook_url, webhook_events, config, metadata
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 		) RETURNING id, created_at, updated_at
 	`
 	return r.db.QueryRow(ctx, query,
-		i.TenantID, i.InstanceID, i.InstanceName, i.APIKey, i.BaseURL, i.Status,
+		i.InstanceID, i.InstanceName, i.APIKey, i.BaseURL, i.Status,
 		i.QRCode, i.PhoneNumber, i.WebhookURL, i.WebhookEvents, i.Config, i.Metadata,
 	).Scan(&i.ID, &i.CreatedAt, &i.UpdatedAt)
 }
@@ -52,113 +71,53 @@ func (r *instanceRepo) Create(ctx context.Context, i *models.EvolutionInstance) 
 func (r *instanceRepo) CreateTx(ctx context.Context, tx pgx.Tx, i *models.EvolutionInstance) error {
 	query := `
 		INSERT INTO evolution_instances (
-			tenant_id, instance_id, instance_name, api_key, base_url, status,
+			instance_id, instance_name, api_key, base_url, status,
 			qr_code, phone_number, webhook_url, webhook_events, config, metadata
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
 		) RETURNING id, created_at, updated_at
 	`
 	return tx.QueryRow(ctx, query,
-		i.TenantID, i.InstanceID, i.InstanceName, i.APIKey, i.BaseURL, i.Status,
+		i.InstanceID, i.InstanceName, i.APIKey, i.BaseURL, i.Status,
 		i.QRCode, i.PhoneNumber, i.WebhookURL, i.WebhookEvents, i.Config, i.Metadata,
 	).Scan(&i.ID, &i.CreatedAt, &i.UpdatedAt)
 }
 
 func (r *instanceRepo) FindByInstanceID(ctx context.Context, instanceID string) (*models.EvolutionInstance, error) {
-	query := `
-		SELECT id, tenant_id, instance_id, instance_name, api_key, base_url, status,
-			qr_code, phone_number, webhook_url, webhook_events,
-			connected_at, disconnected_at, disconnect_reason,
-			messages_sent, messages_received, config, metadata, created_at, updated_at
-		FROM evolution_instances WHERE instance_id = $1
-	`
-	var i models.EvolutionInstance
-	err := r.db.QueryRow(ctx, query, instanceID).Scan(
-		&i.ID, &i.TenantID, &i.InstanceID, &i.InstanceName, &i.APIKey, &i.BaseURL, &i.Status,
-		&i.QRCode, &i.PhoneNumber, &i.WebhookURL, &i.WebhookEvents,
-		&i.ConnectedAt, &i.DisconnectedAt, &i.DisconnectReason,
-		&i.MessagesSent, &i.MessagesReceived, &i.Config, &i.Metadata, &i.CreatedAt, &i.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &i, nil
+	query := `SELECT` + instanceSelectFields + ` FROM evolution_instances WHERE instance_id = $1`
+	return scanInstance(r.db.QueryRow(ctx, query, instanceID))
 }
 
 func (r *instanceRepo) FindByInstanceName(ctx context.Context, instanceName string) (*models.EvolutionInstance, error) {
-	query := `
-		SELECT id, tenant_id, instance_id, instance_name, api_key, base_url, status,
-			qr_code, phone_number, webhook_url, webhook_events,
-			connected_at, disconnected_at, disconnect_reason,
-			messages_sent, messages_received, config, metadata, created_at, updated_at
-		FROM evolution_instances WHERE instance_name = $1
-	`
-	var i models.EvolutionInstance
-	err := r.db.QueryRow(ctx, query, instanceName).Scan(
-		&i.ID, &i.TenantID, &i.InstanceID, &i.InstanceName, &i.APIKey, &i.BaseURL, &i.Status,
-		&i.QRCode, &i.PhoneNumber, &i.WebhookURL, &i.WebhookEvents,
-		&i.ConnectedAt, &i.DisconnectedAt, &i.DisconnectReason,
-		&i.MessagesSent, &i.MessagesReceived, &i.Config, &i.Metadata, &i.CreatedAt, &i.UpdatedAt,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &i, nil
+	query := `SELECT` + instanceSelectFields + ` FROM evolution_instances WHERE instance_name = $1`
+	return scanInstance(r.db.QueryRow(ctx, query, instanceName))
 }
 
-func (r *instanceRepo) FindDefaultByTenantID(ctx context.Context, tenantID string) (*models.EvolutionInstance, error) {
-	// Usually we would join with tenants to find the default one, or just get the first one created
-	query := `
-		SELECT e.id, e.tenant_id, e.instance_id, e.instance_name, e.api_key, e.base_url, e.status,
-			e.qr_code, e.phone_number, e.webhook_url, e.webhook_events,
-			e.connected_at, e.disconnected_at, e.disconnect_reason,
-			e.messages_sent, e.messages_received, e.config, e.metadata, e.created_at, e.updated_at
-		FROM evolution_instances e
-		JOIN tenants t ON t.id = e.tenant_id AND t.evolution_default_instance = e.instance_name
-		WHERE e.tenant_id = $1
-	`
-	var i models.EvolutionInstance
-	err := r.db.QueryRow(ctx, query, tenantID).Scan(
-		&i.ID, &i.TenantID, &i.InstanceID, &i.InstanceName, &i.APIKey, &i.BaseURL, &i.Status,
-		&i.QRCode, &i.PhoneNumber, &i.WebhookURL, &i.WebhookEvents,
-		&i.ConnectedAt, &i.DisconnectedAt, &i.DisconnectReason,
-		&i.MessagesSent, &i.MessagesReceived, &i.Config, &i.Metadata, &i.CreatedAt, &i.UpdatedAt,
-	)
-	if err != nil {
-		// fallback to getting the first one if default is not properly set
-		queryFallback := `
-			SELECT id, tenant_id, instance_id, instance_name, api_key, base_url, status,
-				qr_code, phone_number, webhook_url, webhook_events,
-				connected_at, disconnected_at, disconnect_reason,
-				messages_sent, messages_received, config, metadata, created_at, updated_at
-			FROM evolution_instances WHERE tenant_id = $1 ORDER BY created_at ASC LIMIT 1
-		`
-		errFallback := r.db.QueryRow(ctx, queryFallback, tenantID).Scan(
-			&i.ID, &i.TenantID, &i.InstanceID, &i.InstanceName, &i.APIKey, &i.BaseURL, &i.Status,
-			&i.QRCode, &i.PhoneNumber, &i.WebhookURL, &i.WebhookEvents,
-			&i.ConnectedAt, &i.DisconnectedAt, &i.DisconnectReason,
-			&i.MessagesSent, &i.MessagesReceived, &i.Config, &i.Metadata, &i.CreatedAt, &i.UpdatedAt,
-		)
-		if errFallback != nil {
-			return nil, errFallback
+// FindDefault retorna a instância a usar quando o caller não especifica uma
+// explicitamente (ex: POST /notify/send sem "instance"). Tenta EVOLUTION_INSTANCE
+// (nome fixo configurado via env var); se ausente ou não encontrada, cai para a
+// instância mais antiga cadastrada — não há mais conceito de tenant para decidir isso.
+func (r *instanceRepo) FindDefault(ctx context.Context) (*models.EvolutionInstance, error) {
+	if name := os.Getenv("EVOLUTION_INSTANCE"); name != "" {
+		if inst, err := r.FindByInstanceName(ctx, name); err == nil {
+			return inst, nil
 		}
 	}
-	return &i, nil
+	query := `SELECT` + instanceSelectFields + ` FROM evolution_instances ORDER BY created_at ASC LIMIT 1`
+	return scanInstance(r.db.QueryRow(ctx, query))
 }
 
 func (r *instanceRepo) Update(ctx context.Context, i *models.EvolutionInstance) error {
 	query := `
-		UPDATE evolution_instances SET 
-			instance_id = $1, instance_name = $2, api_key = $3, 
+		UPDATE evolution_instances SET
+			instance_id = $1, instance_name = $2, api_key = $3,
 			base_url = $4, status = $5, webhook_url = $6,
 			updated_at = CURRENT_TIMESTAMP
-		WHERE tenant_id = $7 AND (instance_id = $1 OR instance_name = $2)
+		WHERE instance_id = $1 OR instance_name = $2
 	`
-	// Tentamos atualizar pelo tenant_id e ID ou Nome
 	_, err := r.db.Exec(ctx, query,
 		i.InstanceID, i.InstanceName, i.APIKey,
 		i.BaseURL, i.Status, i.WebhookURL,
-		i.TenantID,
 	)
 	return err
 }
@@ -188,12 +147,6 @@ func (r *instanceRepo) FindAll(ctx context.Context) ([]models.EvolutionInstance,
 	return instances, nil
 }
 
-func (r *instanceRepo) GetTenantIDByInstance(ctx context.Context, instanceName string) (string, error) {
-	var tenantID string
-	err := r.db.QueryRow(ctx, "SELECT tenant_id FROM evolution_instances WHERE instance_name = $1", instanceName).Scan(&tenantID)
-	return tenantID, err
-}
-
 func (r *instanceRepo) GetConnectedAt(ctx context.Context, instanceName string) (*time.Time, error) {
 	var connectedAt *time.Time
 	err := r.db.QueryRow(ctx, "SELECT connected_at FROM evolution_instances WHERE instance_name = $1", instanceName).Scan(&connectedAt)
@@ -205,19 +158,6 @@ func (r *instanceRepo) GetConnectedAt(ctx context.Context, instanceName string) 
 		return &now, nil
 	}
 	return connectedAt, nil
-}
-
-func (r *instanceRepo) GetWorkspaceAndID(ctx context.Context, instanceName string) (workspaceID string, instanceID string, err error) {
-	// workspace_id vem do tenant (Directus), não do tenant_id interno da Bridge.
-	// COALESCE garante fallback para tenant_id caso workspace_id ainda não esteja preenchido.
-	query := `
-		SELECT e.id::text, COALESCE(t.workspace_id, e.tenant_id)
-		FROM evolution_instances e
-		JOIN tenants t ON t.id = e.tenant_id
-		WHERE e.instance_name = $1
-	`
-	err = r.db.QueryRow(ctx, query, instanceName).Scan(&instanceID, &workspaceID)
-	return
 }
 
 func (r *instanceRepo) UpdateConnectionState(ctx context.Context, instanceName, state string, phone *string) error {

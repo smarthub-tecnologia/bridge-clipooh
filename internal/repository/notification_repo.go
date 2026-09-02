@@ -22,15 +22,15 @@ func NewNotificationRepository(pool *pgxpool.Pool) *NotificationRepository {
 // assíncrona (callback) sem depender de um ID que só a Bridge conhece. É
 // também o "event_id" usado por pkg/metaconfig.LookupEventIDByPhone pra
 // correlacionar callbacks de entrega da Meta Cloud API.
-func (r *NotificationRepository) Create(ctx context.Context, tenantID, idempotencyKey, to, msgType string, content json.RawMessage, externalID, instanceName string) (*models.NotificationResponse, error) {
+func (r *NotificationRepository) Create(ctx context.Context, idempotencyKey, to, msgType string, content json.RawMessage, externalID, instanceName string) (*models.NotificationResponse, error) {
 	id := externalID
 	if id == "" {
 		id = uuid.New().String()
 	}
 	_, err := r.pool.Exec(ctx, `
-        INSERT INTO notifications (id, tenant_id, idempotency_key, to_number, type, content, status, instance_name, created_at)
-        VALUES ($1, NULLIF($2, '')::UUID, $3, $4, $5, $6, 'queued', $7, NOW())
-    `, id, tenantID, idempotencyKey, to, msgType, content, instanceName)
+        INSERT INTO notifications (id, idempotency_key, to_number, type, content, status, instance_name, created_at)
+        VALUES ($1, $2, $3, $4, $5, 'queued', $6, NOW())
+    `, id, idempotencyKey, to, msgType, content, instanceName)
 	if err != nil {
 		return nil, err
 	}

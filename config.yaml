@@ -46,14 +46,3 @@ policy:
   warmup_days: 7
   warmup_max_messages_per_day: 40
   recipient_cooldown_seconds: 300
-  tenant_rate_limit: 60
-
-callbacks:
-  # Valores reais vêm das envs CALLBACKS_ENABLED / CALLBACKS_DIRECTUS_WEBHOOK_URL /
-  # CALLBACKS_DIRECTUS_WEBHOOK_SECRET (bind explícito em config.go LoadConfig).
-  # Viper não interpreta "${VAR:default}" em YAML — precisa ser um valor literal
-  # válido do tipo do campo, senão o Unmarshal quebra antes de rodar qualquer
-  # override (foi o que causou o panic em callbacks.enabled).
-  directus_webhook_url: ""
-  directus_webhook_secret: ""
-  enabled: false

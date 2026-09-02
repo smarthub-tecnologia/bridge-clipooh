@@ -10,12 +10,16 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
 	"github.com/linkkotech/bridge/internal/models"
 	"github.com/linkkotech/bridge/pkg/metaconfig"
+	"github.com/linkkotech/bridge/pkg/wamidstore"
 )
 
 func TestMain(m *testing.M) {
-	// Default stub: valid config, no Directus calls.
+	// Default stub: valid config, no Meta Graph API calls unless a test overrides it.
 	getMetaConfigFn = func(_ string) (*metaconfig.MetaConfig, error) {
 		return &metaconfig.MetaConfig{
 			PhoneNumberID: "109876543210123",
@@ -25,18 +29,48 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// callbackServer returns an httptest.Server that decodes the first POST body into
-// *captured and signals done exactly once via sync.Once when a request arrives.
-func callbackServer(t *testing.T, done chan struct{}, captured *map[string]interface{}) *httptest.Server {
-	t.Helper()
+// waitOnce returns a channel closed exactly once by the returned func — used
+// to synchronize with the fire-and-forget goroutines in sendMetaMessage /
+// processMetaEvent via the afterMetaSend / afterMetaWebhookEvent test hooks.
+func waitOnce() (done chan struct{}, signal func()) {
+	done = make(chan struct{})
 	var once sync.Once
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if captured != nil {
-			_ = json.NewDecoder(r.Body).Decode(captured)
+	signal = func() { once.Do(func() { close(done) }) }
+	return done, signal
+}
+
+// waitFor blocks until done is closed or 2s elapse (failing the test).
+func waitFor(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for async processing to complete")
+	}
+}
+
+// withObservedLogs temporarily replaces the global zap logger with one that
+// records entries, runs fn, restores the previous global logger, and returns
+// everything logged during fn. Used to assert on the structured logs that
+// replaced the old Directus callback (the bridge no longer notifies any
+// external platform — see notify_meta.go / meta_webhook.go).
+func withObservedLogs(fn func()) []observer.LoggedEntry {
+	core, logs := observer.New(zap.InfoLevel)
+	prev := zap.L()
+	zap.ReplaceGlobals(zap.New(core))
+	defer zap.ReplaceGlobals(prev)
+	fn()
+	return logs.All()
+}
+
+// findLog returns the first captured entry whose message matches, or nil.
+func findLog(entries []observer.LoggedEntry, message string) *observer.LoggedEntry {
+	for _, e := range entries {
+		if e.Message == message {
+			return &e
 		}
-		once.Do(func() { close(done) })
-		w.WriteHeader(http.StatusOK)
-	}))
+	}
+	return nil
 }
 
 func TestMetaSend_Success(t *testing.T) {
@@ -51,18 +85,14 @@ func TestMetaSend_Success(t *testing.T) {
 	}))
 	defer metaMock.Close()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	prevHost := metaGraphAPIHost
 	metaGraphAPIHost = metaMock.URL
 	defer func() { metaGraphAPIHost = prevHost }()
 
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_SECRET", "test-secret")
-	t.Setenv("CALLBACKS_ENABLED", "true")
+	done, signal := waitOnce()
+	prevHook := afterMetaSend
+	afterMetaSend = signal
+	defer func() { afterMetaSend = prevHook }()
 
 	req := &models.NotifyRequest{
 		Instance: "linkko-prod",
@@ -72,23 +102,30 @@ func TestMetaSend_Success(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
-	(&NotifyHandler{}).handleMetaSend(w, r, req)
+
+	entries := withObservedLogs(func() {
+		(&NotifyHandler{}).handleMetaSend(w, r, req)
+		waitFor(t, done)
+	})
 
 	if w.Code != http.StatusAccepted {
 		t.Errorf("expected 202, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for sent callback")
+	if eventID, ok := wamidstore.Get("wamid.HBgL12345"); !ok || eventID != "evt-001" {
+		t.Errorf("wamidstore lookup = (%v, %v), want (evt-001, true)", eventID, ok)
 	}
 
-	if captured["event"] != "sent" {
-		t.Errorf("event = %v, want sent", captured["event"])
+	entry := findLog(entries, "meta send: sent")
+	if entry == nil {
+		t.Fatal("expected a 'meta send: sent' log entry")
 	}
-	if captured["wamid"] != "wamid.HBgL12345" {
-		t.Errorf("wamid = %v, want wamid.HBgL12345", captured["wamid"])
+	fields := entry.ContextMap()
+	if fields["wamid"] != "wamid.HBgL12345" {
+		t.Errorf("wamid = %v, want wamid.HBgL12345", fields["wamid"])
+	}
+	if fields["event_id"] != "evt-001" {
+		t.Errorf("event_id = %v, want evt-001", fields["event_id"])
 	}
 }
 
@@ -150,17 +187,14 @@ func TestMetaSend_MetaApiError(t *testing.T) {
 	}))
 	defer metaMock.Close()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	prevHost := metaGraphAPIHost
 	metaGraphAPIHost = metaMock.URL
 	defer func() { metaGraphAPIHost = prevHost }()
 
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
+	done, signal := waitOnce()
+	prevHook := afterMetaSend
+	afterMetaSend = signal
+	defer func() { afterMetaSend = prevHook }()
 
 	req := &models.NotifyRequest{
 		Instance: "linkko-prod",
@@ -170,23 +204,23 @@ func TestMetaSend_MetaApiError(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
-	(&NotifyHandler{}).handleMetaSend(w, r, req)
+
+	entries := withObservedLogs(func() {
+		(&NotifyHandler{}).handleMetaSend(w, r, req)
+		waitFor(t, done)
+	})
 
 	if w.Code != http.StatusAccepted {
 		t.Errorf("expected 202, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for blocked callback")
+	entry := findLog(entries, "meta send blocked: meta api error")
+	if entry == nil {
+		t.Fatal("expected a 'meta send blocked: meta api error' log entry")
 	}
-
-	if captured["event"] != "blocked_meta_error" {
-		t.Errorf("event = %v, want blocked_meta_error", captured["event"])
-	}
-	if captured["reason"] != "invalid_token" {
-		t.Errorf("reason = %v, want invalid_token", captured["reason"])
+	fields := entry.ContextMap()
+	if fields["reason"] != "invalid_token" {
+		t.Errorf("reason = %v, want invalid_token", fields["reason"])
 	}
 }
 
@@ -199,17 +233,14 @@ func TestMetaSend_InvalidPhone(t *testing.T) {
 	}))
 	defer metaMock.Close()
 
-	done := make(chan struct{})
-	var captured map[string]interface{}
-	cbSrv := callbackServer(t, done, &captured)
-	defer cbSrv.Close()
-
 	prevHost := metaGraphAPIHost
 	metaGraphAPIHost = metaMock.URL
 	defer func() { metaGraphAPIHost = prevHost }()
 
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-	t.Setenv("CALLBACKS_ENABLED", "true")
+	done, signal := waitOnce()
+	prevHook := afterMetaSend
+	afterMetaSend = signal
+	defer func() { afterMetaSend = prevHook }()
 
 	req := &models.NotifyRequest{
 		Instance: "linkko-prod",
@@ -219,20 +250,19 @@ func TestMetaSend_InvalidPhone(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodPost, "/", nil)
-	(&NotifyHandler{}).handleMetaSend(w, r, req)
+
+	entries := withObservedLogs(func() {
+		(&NotifyHandler{}).handleMetaSend(w, r, req)
+		waitFor(t, done)
+	})
 
 	if w.Code != http.StatusAccepted {
 		t.Errorf("expected 202, got %d", w.Code)
 	}
 
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for blocked callback")
-	}
-
-	if captured["reason"] != "invalid_phone_format" {
-		t.Errorf("reason = %v, want invalid_phone_format", captured["reason"])
+	entry := findLog(entries, "meta send blocked: invalid phone format")
+	if entry == nil {
+		t.Fatal("expected a 'meta send blocked: invalid phone format' log entry")
 	}
 	if n := metaHits.Load(); n != 0 {
 		t.Errorf("Meta API received %d requests, want 0", n)

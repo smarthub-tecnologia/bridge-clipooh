@@ -78,27 +78,18 @@ func main() {
 	}
 	defer pool.Close()
 
-	// addon_events e meta_provider_configs vivem no Postgres próprio do bridge
-	// (migrations 014/015) — não há mais dependência de DIRECTUS_DATABASE_URL
-	// nem SUPABASE_DATABASE_URL.
+	// meta_provider_configs vive no Postgres próprio do bridge (migration 015)
 	metaconfig.SetPool(pool)
 
 	// Roda as migrações (se DATABASE_URL não vier da config, pode pegar do env)
 	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		// Apenas para caso a config tenha
-		// dbURL = cfg.Database.URL
-		// Mas no WA-bridge nós não mapeamos database URL no struct, então pegamos do env
-	}
 	if dbURL != "" {
 		runMigrations(dbURL)
 	}
 
 	// Repositórios
-	tenantRepo := repository.NewTenantRepository(pool)
 	instanceRepo := repository.NewInstanceRepository(pool)
 	inboxRepo := repository.NewInboxRepository(pool)
-	eventRepo := repository.NewAddonEventRepository(pool)
 	chatwootUserRepo := repository.NewChatwootUserRepository(pool)
 
 	// Clientes externos
@@ -116,17 +107,15 @@ func main() {
 
 	// BridgeService
 	bridgeService := services.NewBridgeService(
-		tenantRepo,
 		instanceRepo,
 		inboxRepo,
-		eventRepo,
 		evolutionClient,
 		mediaService,
+		cfg.Chatwoot,
 	)
 
 	// Services
 	adminService := services.NewAdminService(
-		tenantRepo,
 		instanceRepo,
 		inboxRepo,
 		chatwootUserRepo,
@@ -134,6 +123,7 @@ func main() {
 		chatwootAdmin,
 		evolutionClient,
 		cfg.Chatwoot.WebhookBase,
+		cfg.Chatwoot,
 	)
 
 	// Redis
@@ -150,7 +140,6 @@ func main() {
 
 	// Instance Limiter & Callbacks
 	instanceLimiter := services.NewInstanceLimiter(redisClient, cfg.Policy)
-	callbackService := services.NewCallbackService(cfg.Callbacks)
 
 	// Notification Repo & Service
 	notifRepo := repository.NewNotificationRepository(pool)
@@ -164,13 +153,11 @@ func main() {
 	msgQueue := queue.NewRedisQueue(redisClient, "wa-bridge:jobs")
 
 	notificationService := services.NewNotificationService(
-		tenantRepo,
 		instanceRepo,
 		notifRepo,
 		evolutionClient,
 		templates,
 		instanceLimiter,
-		callbackService,
 		cfg.Policy,
 		msgQueue,
 	)
@@ -196,8 +183,6 @@ func main() {
 	go msgQueue.ProcessRetries(ctx, workerFunc)
 
 	bridgeService.SetCacheService(cacheService)
-	bridgeService.SetCallbackService(callbackService)
-	adminService.SetCallbackService(callbackService)
 
 	// Métricas
 	metrics := observability.New()
@@ -229,12 +214,6 @@ func main() {
 	r.Use(chimiddleware.Recoverer)
 	r.Use(rateLimiter.LimitByIP(100, 1*time.Minute))
 
-	tenantRateLimit := cfg.Policy.TenantRateLimit
-	if tenantRateLimit <= 0 {
-		tenantRateLimit = 60
-	}
-	r.Use(rateLimiter.LimitByTenant(tenantRateLimit, 1*time.Minute))
-
 	// Health
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -252,11 +231,12 @@ func main() {
 	r.Get("/health/live", healthHandler.Live)
 	r.Get("/health/ready", healthHandler.Ready)
 
-	// Webhooks
+	// Webhooks — resolução 100% por instance_name, sem ?tenant= (single-tenant)
 	r.Post("/webhook/evolution", evolutionHandler.HandleWebhook)
 	r.Post("/webhook/chatwoot", chatwootHandler.HandleWebhook)
 
-	// Admin API (protegida por ADMIN_API_KEY)
+	// Admin API (protegida por ADMIN_API_KEY) — não há mais rotas de tenant;
+	// só existe uma conta Chatwoot (fixa via env vars) e N instâncias Evolution.
 	r.Route("/api/v1/admin", func(r chi.Router) {
 		r.Use(func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -269,16 +249,11 @@ func main() {
 				next.ServeHTTP(w, r)
 			})
 		})
-		r.Post("/tenants", adminHandler.CreateTenant)
-		r.Get("/tenants/{id}", adminHandler.GetTenant)
-		r.Delete("/tenants/{id}", adminHandler.DeleteTenant)
-		r.Post("/tenants/{id}/connect", adminHandler.ConnectTenant)
-		r.Put("/tenants/{id}/chatwoot-webhook-secret", adminHandler.SetChatwootWebhookSecret)
-		r.Post("/tenants/{id}/sync-chatwoot-secret", adminHandler.SyncChatwootSecret)
-		r.Post("/tenants/{id}/chatwoot-widget-inbox", adminHandler.CreateWidgetInbox)
-		r.Post("/tenants/{id}/chatwoot-widget-webhook/sync", adminHandler.SyncWidgetWebhook)
-		r.Post("/tenants/{id}/agents", adminHandler.CreateAgent)
-		r.Delete("/tenants/{id}/agents/{agentId}", adminHandler.RemoveAgent)
+		r.Post("/instances", adminHandler.CreateInstance)
+		r.Post("/chatwoot-widget-inbox", adminHandler.CreateWidgetInbox)
+		r.Post("/chatwoot-widget-webhook/sync", adminHandler.SyncWidgetWebhook)
+		r.Post("/agents", adminHandler.CreateAgent)
+		r.Delete("/agents/{agentId}", adminHandler.RemoveAgent)
 		r.Get("/metrics", metricsHandler.GetMetrics)
 	})
 
@@ -291,6 +266,8 @@ func main() {
 			r.Get("/notify/status/{id}", notifyHandler.GetStatus)
 			r.Get("/instances", notifyHandler.ListInstances)
 			r.Get("/instances/{instanceName}/qr", notifyHandler.GetQRCode)
+			// Endpoint canônico único de reconexão de instância (reconfigura
+			// webhook + gera QR) — consolida o antigo POST /admin/tenants/{id}/connect
 			r.Post("/instances/{instanceName}/connect", notifyHandler.TriggerConnect)
 			r.Post("/instances/{instanceName}/recreate", notifyHandler.RecreateInstance)
 			r.Delete("/instances/{instanceName}/logout", notifyHandler.LogoutInstance)

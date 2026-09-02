@@ -11,25 +11,28 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/linkkotech/bridge/internal/config"
 	"github.com/linkkotech/bridge/internal/models"
 	"github.com/linkkotech/bridge/internal/repository"
 	"go.uber.org/zap"
 )
 
+// AdminService cuida do provisionamento/manutenção de instâncias Evolution GO
+// e de operações administrativas na única conta Chatwoot da Cartão Pro
+// (AccountID/APIToken fixos, ver config.ChatwootConfig). Não há mais conceito
+// de tenant: a conta Chatwoot já existe e não é criada nem removida por aqui.
 type AdminService struct {
 	db               *pgxpool.Pool
-	tenantRepo       repository.TenantRepository
 	instanceRepo     repository.InstanceRepository
 	inboxRepo        *repository.InboxRepository
 	chatwootUserRepo *repository.ChatwootUserRepository
 	chatwootAdmin    *ChatwootAdminClient
 	evolution        *EvolutionClient
 	webhookBaseURL   string
-	callbackService  *CallbackService
+	chatwoot         config.ChatwootConfig
 }
 
 func NewAdminService(
-	tenantRepo repository.TenantRepository,
 	instanceRepo repository.InstanceRepository,
 	inboxRepo *repository.InboxRepository,
 	chatwootUserRepo *repository.ChatwootUserRepository,
@@ -37,437 +40,128 @@ func NewAdminService(
 	chatwootAdmin *ChatwootAdminClient,
 	evolution *EvolutionClient,
 	webhookBaseURL string,
+	chatwootCfg config.ChatwootConfig,
 ) *AdminService {
 	return &AdminService{
 		db:               db,
-		tenantRepo:       tenantRepo,
 		instanceRepo:     instanceRepo,
 		inboxRepo:        inboxRepo,
 		chatwootUserRepo: chatwootUserRepo,
 		chatwootAdmin:    chatwootAdmin,
 		evolution:        evolution,
 		webhookBaseURL:   webhookBaseURL,
+		chatwoot:         chatwootCfg,
 	}
 }
 
-// SetCallbackService injects the callback service
-func (s *AdminService) SetCallbackService(c *CallbackService) {
-	s.callbackService = c
+// CreateInstanceRequest payload recebido do dashboard para provisionar uma
+// nova linha WhatsApp (instância Evolution GO) na conta Cartão Pro já existente.
+type CreateInstanceRequest struct {
+	InstanceName string `json:"instance_name"`
 }
 
-// CreateTenantRequest payload recebido do dashboard
-type CreateTenantRequest struct {
-	WorkspaceID   string `json:"workspace_id"`
-	Name          string `json:"name"`
-	Domain        string `json:"domain"`
-	ExternalID    string `json:"external_id"`
-	AdminEmail    string `json:"admin_email"`    // email do admin da conta Chatwoot
-	AdminPassword string `json:"admin_password"` // senha do admin
-	InstanceName  string `json:"instance_name"`
-	EvolutionOnly bool   `json:"evolution_only"` // provisiona apenas a Evolution, sem criar conta Chatwoot
+// CreateInstanceResponse resposta da criação de instância.
+type CreateInstanceResponse struct {
+	InstanceName string `json:"instance_name"`
+	Status       string `json:"status"`
 }
 
-// TenantResponse resposta da criação
-type TenantResponse struct {
-	ID                  string `json:"tenant_id"`
-	WorkspaceID         string `json:"workspace_id"`
-	ChatwootAccountID   int    `json:"chatwoot_account_id,omitempty"`
-	ChatwootInboxID     int    `json:"chatwoot_inbox_id,omitempty"`
-	EvolutionInstanceID string `json:"evolution_instance_id,omitempty"`
-	QRCode              string `json:"qr_code,omitempty"`
-	Status              string `json:"status"`
-	CorrelationID       string `json:"correlation_id"`
-}
+// CreateInstance provisiona uma nova instância Evolution GO (linha WhatsApp)
+// e configura o webhook dela. Não cria nada no Chatwoot — a conta, o usuário
+// admin e a inbox "api" já existem fixos (CHATWOOT_ACCOUNT_ID/API_TOKEN) desde
+// que o bridge deixou de ser multi-tenant.
+func (s *AdminService) CreateInstance(ctx context.Context, req CreateInstanceRequest) (*CreateInstanceResponse, error) {
+	logger := zap.L().With(zap.String("operation", "create_instance"))
 
-// CreateTenant provisiona um tenant completo
-func (s *AdminService) CreateTenant(ctx context.Context, req CreateTenantRequest) (*TenantResponse, error) {
-	logger := zap.L().With(zap.String("operation", "create_tenant"), zap.String("name", req.Name))
-
-	// 0. Gera UUID único por provisão — workspace_id é salvo separadamente
-	tenantID := uuid.New().String()
-	workspaceID := req.WorkspaceID
-
-	var account *models.ChatwootCreateAccountResponse
-	var user *models.ChatwootCreateUserResponse
-	var chatwootAccessToken string
-	var inbox *models.ChatwootCreateInboxResponse
-	var evolutionResp *models.EvolutionCreateInstanceResponse
-	var evolutionInstanceID string
-	var instanceToken string
-
-	var err error
-
-	// 1–3a. Provisiona conta, usuário e inbox no Chatwoot (pulado em modo evolution_only)
-	var webhookSecret string
-	webhookChatwootConfigured := false
-	newInbox := false
-
-	if !req.EvolutionOnly {
-		// 1. Cria conta no Chatwoot (mobiochat.com)
-		if account == nil {
-			chatwootReq := models.ChatwootCreateAccountRequest{
-				Name:   req.Name,
-				Locale: "pt_BR",
-			}
-			account, err = s.chatwootAdmin.CreateAccount(ctx, chatwootReq)
-			if err != nil {
-				logger.Error("failed to create chatwoot account", zap.Error(err))
-				return nil, fmt.Errorf("failed to create chatwoot account: %w", err)
-			}
-			logger.Info("chatwoot account created", zap.Int("account_id", account.ID))
-		}
-
-		// 2a. Cria o usuário administrador no Chatwoot (ou recupera se já existir)
-		userReq := models.ChatwootCreateUserRequest{
-			Name:     fmt.Sprintf("Admin %s", req.Name),
-			Email:    req.AdminEmail,
-			Password: req.AdminPassword,
-		}
-		user, err = s.chatwootAdmin.CreateUser(ctx, userReq)
-		if err != nil {
-			// Usuário já existe (422) ou outro erro — token será obtido via GetAccountAccessToken abaixo.
-			// Sem o ID desse usuário não dá pra vinculá-lo à conta nova (a Platform
-			// API do Chatwoot não tem endpoint de busca por e-mail) — por isso
-			// consultamos o cache local (chatwoot_users) alimentado em provisões
-			// anteriores que criaram esse mesmo e-mail com sucesso.
-			logger.Warn("could not create chatwoot user (possibly already exists), will fetch token", zap.Error(err))
-
-			if s.chatwootUserRepo != nil {
-				cachedID, found, cacheErr := s.chatwootUserRepo.GetByEmail(ctx, req.AdminEmail)
-				if cacheErr != nil {
-					logger.Warn("failed to query chatwoot_users cache", zap.Error(cacheErr))
-				} else if found {
-					existingUser := &models.ChatwootCreateUserResponse{
-						ID:       cachedID,
-						Email:    req.AdminEmail,
-						Accounts: []models.ChatwootUserAccountRef{{}}, // não-vazio: marca usuário pré-existente pro guard de rollback
-					}
-					if linkErr := s.linkOrRollbackAgent(ctx, account.ID, existingUser, "administrator"); linkErr != nil {
-						logger.Warn("failed to link cached user to account", zap.Error(linkErr))
-					} else {
-						logger.Info("linked pre-existing chatwoot user via local cache", zap.Int("user_id", cachedID))
-					}
-				} else {
-					logger.Warn("no chatwoot_users cache entry for this email — admin will need to be added to the account manually",
-						zap.String("email", req.AdminEmail))
-				}
-			}
-		} else {
-			logger.Info("chatwoot user created", zap.Int("user_id", user.ID))
-			if chatwootAccessToken == "" && user.AccessToken != "" {
-				chatwootAccessToken = user.AccessToken
-				logger.Info("captured access token from newly created user")
-			}
-
-			// 2b. Vincula o usuário à conta como Administrator — usa o helper
-			// compartilhado com CreateAgent (mesma checagem de segurança de
-			// rollback), mas mantém o comportamento tolerante de sempre: só
-			// loga e segue, nunca aborta o provisionamento do combo por causa
-			// disso (a inbox/Evolution são mais críticos que o vínculo do
-			// admin, que pode ser refeito manualmente depois).
-			if err := s.linkOrRollbackAgent(ctx, account.ID, user, "administrator"); err != nil {
-				logger.Warn("failed to link user to account, possibly already linked", zap.Error(err))
-			}
-
-			// Alimenta o cache pra próximas provisões que reusarem este e-mail.
-			if s.chatwootUserRepo != nil {
-				if cacheErr := s.chatwootUserRepo.Upsert(ctx, req.AdminEmail, user.ID); cacheErr != nil {
-					logger.Warn("failed to cache chatwoot user id (non-fatal)", zap.Error(cacheErr))
-				}
-			}
-		}
-
-		// 3. Obtém token de acesso da conta (sempre tenta se ainda vazio)
-		if chatwootAccessToken == "" {
-			for i := 0; i < 3; i++ {
-				token, err := s.chatwootAdmin.GetAccountAccessToken(ctx, account.ID)
-				if err == nil {
-					chatwootAccessToken = token
-					break
-				}
-				logger.Warn("failed to get account access token, will retry", zap.Error(err))
-				time.Sleep(2 * time.Second)
-			}
-			if chatwootAccessToken == "" {
-				return nil, fmt.Errorf("failed to obtain chatwoot access token for account %d", account.ID)
-			}
-		}
-
-		// 3.5 Garante os Custom Attribute Definitions profile_id/profile_slug na
-		// conta — ver comentário em ensureProfileCustomAttributes. Best-effort:
-		// nunca aborta o provisionamento do combo.
-		s.ensureProfileCustomAttributes(ctx, account.ID, chatwootAccessToken)
-
-		// 3a. Cria Inbox no Chatwoot
-		if inbox == nil {
-			expandedWebhookBase := os.ExpandEnv(s.webhookBaseURL)
-			chatwootWebhookURL := fmt.Sprintf("%s/webhook/chatwoot?tenant=%s", expandedWebhookBase, tenantID)
-
-			// Não enviamos webhook_secret — o Chatwoot ignora o valor externo e gera o seu
-			// próprio (campo "secret" na resposta). Enviá-lo causaria divergência no banco.
-			inboxReq := models.ChatwootCreateInboxRequest{
-				Name: "WhatsApp",
-				Channel: models.ChatwootChannelApi{
-					Type:       "api",
-					WebhookURL: chatwootWebhookURL,
-				},
-			}
-			inbox, err = s.chatwootAdmin.CreateInbox(ctx, account.ID, chatwootAccessToken, inboxReq)
-			if err != nil {
-				logger.Error("failed to create chatwoot inbox", zap.Error(err))
-				return nil, fmt.Errorf("failed to create chatwoot inbox: %w", err)
-			}
-			logger.Info("chatwoot inbox created", zap.Int("inbox_id", inbox.ID))
-
-			// Captura o secret gerado pelo Chatwoot (campo "secret" no payload de resposta).
-			// Sem este valor não há como validar HMAC — abortamos para evitar tenant sem segurança.
-			if inbox.Secret == "" {
-				logger.Error("chatwoot inbox created but secret not returned — cannot configure HMAC validation",
-					zap.Int("inbox_id", inbox.ID),
-				)
-				return nil, fmt.Errorf("chatwoot inbox created but secret not returned (inbox_id: %d)", inbox.ID)
-			}
-			webhookSecret = inbox.Secret
-			logger.Info("captured chatwoot-generated webhook secret", zap.Int("secret_len", len(webhookSecret)))
-			webhookChatwootConfigured = true
-			newInbox = true
-		}
+	var instanceName string
+	shortHash := uuid.New().String()[:6]
+	if req.InstanceName != "" {
+		baseName := strings.ToLower(strings.ReplaceAll(req.InstanceName, " ", "-"))
+		instanceName = fmt.Sprintf("%s-%s", baseName, shortHash)
+	} else {
+		instanceName = fmt.Sprintf("inst-%s", shortHash)
 	}
 
-	// 4. Provisiona instância Evolution GO
-	var evolutionWebhookUrl string
-	webhookEvolutionConfigured := false
+	evolutionInstanceID := uuid.New().String()
+	instanceToken := uuid.New().String()
 	evolutionBaseURL := os.Getenv("EVOLUTION_BASE_URL")
-	var newInstance *models.EvolutionInstance
-	if evolutionResp == nil {
-		var instanceName string
-		shortHash := uuid.New().String()[:6]
-		if req.InstanceName != "" {
-			baseName := strings.ToLower(strings.ReplaceAll(req.InstanceName, " ", "-"))
-			instanceName = fmt.Sprintf("%s-%s", baseName, shortHash)
-		} else {
-			instanceName = fmt.Sprintf("inst-%s", shortHash)
-		}
 
-		evolutionInstanceID = uuid.New().String()
-		instanceToken = uuid.New().String()
-
-		instanceReq := models.EvolutionCreateInstanceRequest{
-			Name:       instanceName,
-			InstanceID: evolutionInstanceID,
-			Token:      instanceToken,
-			AdvancedSettings: &models.EvolutionAdvancedSettings{
-				AlwaysOnline:  true,
-				IgnoreGroups:  true,
-				IgnoreStatus:  true,
-				MsgRejectCall: "This number does not accept calls. Please send a text message.",
-				ReadMessages:  true,
-				RejectCall:    true,
-			},
-		}
-		evolutionResp, err = s.evolution.CreateInstance(ctx, instanceReq)
-		if err != nil {
-			logger.Error("failed to create evolution go instance", zap.Error(err))
-			return nil, fmt.Errorf("failed to create evolution go instance: %w", err)
-		}
-
-		if evolutionResp.InstanceID == "" {
-			evolutionResp.InstanceID = evolutionInstanceID
-		}
-		if evolutionResp.Name == "" {
-			evolutionResp.Name = instanceName
-		}
-		evolutionResp.Token = instanceToken
-
-		expandedEvolutionWebhookBase := os.ExpandEnv(s.webhookBaseURL)
-		evoWebhookSecret := os.Getenv("WEBHOOK_SECRET_EVOLUTION")
-		evolutionWebhookUrl = fmt.Sprintf("%s/webhook/evolution?instance=%s&tenant=%s", expandedEvolutionWebhookBase, evolutionResp.Name, tenantID)
-		if evoWebhookSecret != "" {
-			evolutionWebhookUrl += "&token=" + evoWebhookSecret
-		}
-
-		// Captura os dados para persistir na transação — não salva no banco ainda.
-		newInstance = &models.EvolutionInstance{
-			TenantID:     tenantID,
-			InstanceID:   evolutionResp.InstanceID,
-			InstanceName: evolutionResp.Name,
-			APIKey:       &evolutionResp.Token,
-			BaseURL:      &evolutionBaseURL,
-			WebhookURL:   &evolutionWebhookUrl,
-			Status:       "created",
-		}
-
-		// 4.2 Conecta e configura Webhook na Evolution GO
-		connectReq := models.EvolutionConnectRequest{
-			Immediate:  false,
-			WebhookUrl: evolutionWebhookUrl,
-			Subscribe: []string{
-				"MESSAGE",
-				"CONNECTION",
-				"QRCODE",
-			},
-		}
-
-		err = s.evolution.ConnectInstance(ctx, evolutionResp.Token, connectReq)
-		if err != nil {
-			logger.Error("failed to connect evolution go instance and set webhook — webhook not configured",
-				zap.String("instance_id", evolutionResp.InstanceID),
-				zap.Error(err),
-			)
-		} else {
-			webhookEvolutionConfigured = true
-		}
+	instanceReq := models.EvolutionCreateInstanceRequest{
+		Name:       instanceName,
+		InstanceID: evolutionInstanceID,
+		Token:      instanceToken,
+		AdvancedSettings: &models.EvolutionAdvancedSettings{
+			AlwaysOnline:  true,
+			IgnoreGroups:  true,
+			IgnoreStatus:  true,
+			MsgRejectCall: "This number does not accept calls. Please send a text message.",
+			ReadMessages:  true,
+			RejectCall:    true,
+		},
 	}
-
-	// 6. Persiste tudo atomicamente numa única transação de banco.
-	instanceName := evolutionResp.Name
-	var domainPtr *string
-	if req.Domain != "" {
-		domainPtr = &req.Domain
-	}
-	var externalIDPtr *string
-	if req.ExternalID != "" {
-		externalIDPtr = &req.ExternalID
-	}
-	var chatwootAccountIDPtr *int
-	var chatwootAPITokenPtr *string
-	var chatwootWebhookSecretPtr *string
-	if account != nil {
-		chatwootAccountIDPtr = &account.ID
-		chatwootAPITokenPtr = &chatwootAccessToken
-		chatwootWebhookSecretPtr = &webhookSecret
-	}
-	tenant := &models.Tenant{
-		ID:                         tenantID,
-		WorkspaceID:                &workspaceID,
-		Name:                       req.Name,
-		Domain:                     domainPtr,
-		ExternalID:                 externalIDPtr,
-		Status:                     "active",
-		ChatwootAccountID:          chatwootAccountIDPtr,
-		ChatwootAPIToken:           chatwootAPITokenPtr,
-		ChatwootWebhookSecret:      chatwootWebhookSecretPtr,
-		EvolutionBaseURL:           &evolutionBaseURL,
-		EvolutionDefaultInstance:   &instanceName,
-		WebhookEvolutionConfigured: webhookEvolutionConfigured,
-		WebhookChatwootConfigured:  webhookChatwootConfigured,
-	}
-
-	tx, err := s.db.Begin(ctx)
+	evolutionResp, err := s.evolution.CreateInstance(ctx, instanceReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+		logger.Error("failed to create evolution go instance", zap.Error(err))
+		return nil, fmt.Errorf("failed to create evolution go instance: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	if evolutionResp.InstanceID == "" {
+		evolutionResp.InstanceID = evolutionInstanceID
+	}
+	if evolutionResp.Name == "" {
+		evolutionResp.Name = instanceName
+	}
+	evolutionResp.Token = instanceToken
 
-	if err := s.tenantRepo.CreateTx(ctx, tx, tenant); err != nil {
-		logger.Error("failed to persist tenant", zap.Error(err))
-		return nil, fmt.Errorf("failed to save tenant: %w", err)
+	expandedWebhookBase := os.ExpandEnv(s.webhookBaseURL)
+	evoWebhookSecret := os.Getenv("WEBHOOK_SECRET_EVOLUTION")
+	evolutionWebhookUrl := fmt.Sprintf("%s/webhook/evolution?instance=%s", expandedWebhookBase, evolutionResp.Name)
+	if evoWebhookSecret != "" {
+		evolutionWebhookUrl += "&token=" + evoWebhookSecret
 	}
 
-	if newInstance != nil {
-		if err := s.instanceRepo.CreateTx(ctx, tx, newInstance); err != nil {
-			logger.Error("CRITICAL: evolution instance created in API but failed to persist to DB — orphan instance",
-				zap.String("instance_id", newInstance.InstanceID),
-				zap.String("instance_name", newInstance.InstanceName),
-				zap.Error(err),
-			)
-			return nil, fmt.Errorf("failed to save instance: %w", err)
-		}
-		logger.Info("evolution instance staged in transaction",
-			zap.String("instance_id", newInstance.InstanceID),
-			zap.String("instance_name", newInstance.InstanceName),
+	newInstance := &models.EvolutionInstance{
+		InstanceID:   evolutionResp.InstanceID,
+		InstanceName: evolutionResp.Name,
+		APIKey:       &evolutionResp.Token,
+		BaseURL:      &evolutionBaseURL,
+		WebhookURL:   &evolutionWebhookUrl,
+		Status:       "created",
+	}
+
+	// Conecta e configura Webhook na Evolution GO — falha aqui não impede o
+	// provisionamento (o webhook pode ser reconfigurado depois via /connect),
+	// só fica registrado no log.
+	connectReq := models.EvolutionConnectRequest{
+		Immediate:  false,
+		WebhookUrl: evolutionWebhookUrl,
+		Subscribe: []string{
+			"MESSAGE",
+			"CONNECTION",
+			"QRCODE",
+		},
+	}
+	if err := s.evolution.ConnectInstance(ctx, evolutionResp.Token, connectReq); err != nil {
+		logger.Error("failed to connect evolution go instance and set webhook — webhook not configured",
+			zap.String("instance_id", evolutionResp.InstanceID),
+			zap.Error(err),
 		)
 	}
 
-	if newInbox {
-		if err := s.inboxRepo.SaveInboxTx(ctx, tx, tenantID, account.ID, inbox.ID, inbox.Name); err != nil {
-			logger.Warn("failed to save inbox to local DB", zap.Error(err))
-		}
+	if err := s.instanceRepo.Create(ctx, newInstance); err != nil {
+		logger.Error("CRITICAL: evolution instance created in API but failed to persist to DB — orphan instance",
+			zap.String("instance_id", newInstance.InstanceID),
+			zap.String("instance_name", newInstance.InstanceName),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("failed to save instance: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit provisioning transaction: %w", err)
-	}
+	logger.Info("instance provisioned successfully", zap.String("instance_name", evolutionResp.Name))
 
-	var chatwootAccountID int
-	var chatwootInboxID int
-	if account != nil {
-		chatwootAccountID = account.ID
-	}
-	if inbox != nil {
-		chatwootInboxID = inbox.ID
-	}
-	logger.Info("provisioning transaction committed",
-		zap.String("tenant_id", tenantID),
-		zap.Int("chatwoot_account_id", chatwootAccountID),
-	)
-
-	// Em Evolution Go, o QRCode não vem no payload de criação. Ele precisará ser puxado num endpoint separado ou websocket!
-	qrCode := ""
-
-	logger.Info("tenant provisioned successfully",
-		zap.String("tenant_id", tenantID),
-		zap.Int("chatwoot_account_id", chatwootAccountID),
-		zap.String("evolution_instance", evolutionResp.Name),
-	)
-
-	return &TenantResponse{
-		ID:                  tenantID,
-		WorkspaceID:         workspaceID,
-		ChatwootAccountID:   chatwootAccountID,
-		ChatwootInboxID:     chatwootInboxID,
-		EvolutionInstanceID: evolutionResp.Name,
-		QRCode:              qrCode,
-		Status:              "active",
-		CorrelationID:       tenantID,
+	return &CreateInstanceResponse{
+		InstanceName: evolutionResp.Name,
+		Status:       "created",
 	}, nil
-}
-
-// DeleteTenant deletes a tenant
-func (s *AdminService) DeleteTenant(ctx context.Context, tenantID string) error {
-	return s.tenantRepo.Delete(ctx, tenantID)
-}
-
-// GetTenant gets a tenant
-func (s *AdminService) GetTenant(ctx context.Context, tenantID string) (*models.Tenant, error) {
-	return s.tenantRepo.FindByID(ctx, tenantID)
-}
-
-func (s *AdminService) UpdateTenant(ctx context.Context, t *models.Tenant) error {
-	return s.tenantRepo.Update(ctx, t)
-}
-
-// SyncChatwootSecret busca o secret real da inbox no Chatwoot e atualiza o banco.
-// Usado para corrigir tenants antigos que foram provisionados com secret divergente.
-func (s *AdminService) SyncChatwootSecret(ctx context.Context, tenantID string) (int, error) {
-	logger := zap.L().With(zap.String("operation", "sync_chatwoot_secret"), zap.String("tenant_id", tenantID))
-
-	tenant, err := s.tenantRepo.FindByID(ctx, tenantID)
-	if err != nil || tenant == nil {
-		return 0, fmt.Errorf("tenant not found: %w", err)
-	}
-	if tenant.ChatwootAccountID == nil || tenant.ChatwootAPIToken == nil {
-		return 0, fmt.Errorf("tenant missing chatwoot_account_id or chatwoot_api_token")
-	}
-
-	inbox, err := s.chatwootAdmin.GetFirstInbox(ctx, *tenant.ChatwootAccountID, *tenant.ChatwootAPIToken)
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch inbox from chatwoot: %w", err)
-	}
-	if inbox.Secret == "" {
-		return 0, fmt.Errorf("chatwoot returned inbox without secret field (inbox_id: %d)", inbox.ID)
-	}
-
-	tenant.ChatwootWebhookSecret = &inbox.Secret
-	if err := s.tenantRepo.Update(ctx, tenant); err != nil {
-		return 0, fmt.Errorf("failed to update tenant secret: %w", err)
-	}
-
-	logger.Info("chatwoot secret synced successfully",
-		zap.Int("inbox_id", inbox.ID),
-		zap.Int("secret_len", len(inbox.Secret)),
-	)
-	return len(inbox.Secret), nil
 }
 
 // CreateWidgetInboxResponse é o retorno do endpoint admin de criação de inbox
@@ -604,53 +298,15 @@ func missingSubscriptions(have []string, desired []string) []string {
 }
 
 // CreateWidgetInbox cria uma inbox tipo Website (widget público) na MESMA conta
-// Chatwoot do combo já provisionado pra este tenant — usada pelo addon "Widget
-// de Chat do Perfil Digital" (Next.js). Reaproveita o token de acesso da conta
-// já persistido em tenant.ChatwootAPIToken (gravado no CreateTenant original);
-// se ausente (tenants antigos ou evolution_only), busca um novo via
-// GetAccountAccessToken — mesmo fallback que CreateTenant usa pro inbox "api".
-//
-// O que É tenant.ChatwootAPIToken, exatamente (investigado numa tentativa
-// anterior de reusá-lo pra resolver avatar de agente no widget público, hoje
-// descomissionada): NA PRÁTICA é o access_token pessoal do usuário
-// "Admin {nome do tenant}" criado durante CreateTenant (ver CreateUser +
-// user.AccessToken, linhas ~118-132 acima) — um administrador HUMANO de
-// verdade na conta, não um bot/agente de sistema dedicado. Só cai para um
-// token minerado via Platform API (GetAccountAccessToken, sem usuário
-// associado) se aquele Admin já existia ou falhou ao criar. Por ser um token
-// de acesso total à conta (não escopado), decidiu-se não expô-lo fora do
-// Bridge — o widget público resolve avatar/nome via config manual
-// (agent_display_avatar_url/agent_display_name em workspace_chat_inboxes),
-// não mais via Application API.
-func (s *AdminService) CreateWidgetInbox(ctx context.Context, tenantID string, name string) (*CreateWidgetInboxResponse, error) {
-	logger := zap.L().With(zap.String("operation", "create_widget_inbox"), zap.String("tenant_id", tenantID))
+// Chatwoot da Cartão Pro — usada pelo addon "Widget de Chat do Perfil Digital"
+// (Next.js). Usa CHATWOOT_API_TOKEN fixo (o antigo fallback via
+// GetAccountAccessToken só fazia sentido quando esse token vinha de um usuário
+// criado por-tenant; agora é sempre o mesmo).
+func (s *AdminService) CreateWidgetInbox(ctx context.Context, name string) (*CreateWidgetInboxResponse, error) {
+	logger := zap.L().With(zap.String("operation", "create_widget_inbox"))
 
-	tenant, err := s.tenantRepo.FindByID(ctx, tenantID)
-	if err != nil || tenant == nil {
-		return nil, fmt.Errorf("tenant not found: %w", err)
-	}
-	if tenant.ChatwootAccountID == nil {
-		return nil, fmt.Errorf("tenant %s has no chatwoot account provisioned", tenantID)
-	}
-	accountID := *tenant.ChatwootAccountID
-
-	chatwootAccessToken := ""
-	if tenant.ChatwootAPIToken != nil && *tenant.ChatwootAPIToken != "" {
-		chatwootAccessToken = *tenant.ChatwootAPIToken
-	} else {
-		for i := 0; i < 3; i++ {
-			token, tokenErr := s.chatwootAdmin.GetAccountAccessToken(ctx, accountID)
-			if tokenErr == nil {
-				chatwootAccessToken = token
-				break
-			}
-			logger.Warn("failed to get account access token, will retry", zap.Error(tokenErr))
-			time.Sleep(2 * time.Second)
-		}
-	}
-	if chatwootAccessToken == "" {
-		return nil, fmt.Errorf("failed to obtain chatwoot access token for account %d", accountID)
-	}
+	accountID := s.chatwoot.AccountID
+	chatwootAccessToken := s.chatwoot.APIToken
 
 	inboxName := name
 	if inboxName == "" {
@@ -658,8 +314,7 @@ func (s *AdminService) CreateWidgetInbox(ctx context.Context, tenantID string, n
 	}
 
 	// website_url é obrigatório na Chatwoot (422 sem ele) — só metadado exibido
-	// no painel, não afeta o funcionamento do widget. Sem um domínio por-tenant
-	// disponível aqui, usa o domínio genérico da plataforma.
+	// no painel, não afeta o funcionamento do widget.
 	websiteURL := "https://cartaopro.com"
 
 	inbox, err := s.chatwootAdmin.CreateWebsiteInbox(ctx, accountID, chatwootAccessToken, inboxName, websiteURL)
@@ -696,39 +351,13 @@ type SyncWidgetWebhookResponse struct {
 }
 
 // SyncWidgetWebhook re-executa só a etapa de webhook de CreateWidgetInbox —
-// nunca chama CreateWebsiteInbox, então é seguro rodar em tenants que já têm
-// o widget provisionado (ao contrário de re-chamar CreateWidgetInbox, que
-// duplicaria a inbox no Chatwoot). Existe pra migrar contas antigas que
-// ativaram o widget antes de widgetWebhookSubscriptions incluir o typing.
-func (s *AdminService) SyncWidgetWebhook(ctx context.Context, tenantID string) (*SyncWidgetWebhookResponse, error) {
-	tenant, err := s.tenantRepo.FindByID(ctx, tenantID)
-	if err != nil || tenant == nil {
-		return nil, fmt.Errorf("tenant not found: %w", err)
-	}
-	if tenant.ChatwootAccountID == nil {
-		return nil, fmt.Errorf("tenant %s has no chatwoot account provisioned", tenantID)
-	}
-	accountID := *tenant.ChatwootAccountID
+// nunca chama CreateWebsiteInbox, então é seguro rodar de novo (não duplica
+// a inbox no Chatwoot). Existe pra migrar a conta se widgetWebhookSubscriptions
+// ganhar novos eventos no futuro.
+func (s *AdminService) SyncWidgetWebhook(ctx context.Context) (*SyncWidgetWebhookResponse, error) {
+	accountID := s.chatwoot.AccountID
+	chatwootAccessToken := s.chatwoot.APIToken
 
-	chatwootAccessToken := ""
-	if tenant.ChatwootAPIToken != nil && *tenant.ChatwootAPIToken != "" {
-		chatwootAccessToken = *tenant.ChatwootAPIToken
-	} else {
-		for i := 0; i < 3; i++ {
-			token, tokenErr := s.chatwootAdmin.GetAccountAccessToken(ctx, accountID)
-			if tokenErr == nil {
-				chatwootAccessToken = token
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-	}
-	if chatwootAccessToken == "" {
-		return nil, fmt.Errorf("failed to obtain chatwoot access token for account %d", accountID)
-	}
-
-	// Backfill pros tenants provisionados antes desta feature existir (hoje:
-	// Cartão PRO) — mesmo mecanismo usado pelo webhook logo abaixo.
 	s.ensureProfileCustomAttributes(ctx, accountID, chatwootAccessToken)
 
 	webhookSecret, err := s.ensureWidgetWebhook(ctx, accountID, chatwootAccessToken)
@@ -744,7 +373,7 @@ func (s *AdminService) SyncWidgetWebhook(ctx context.Context, tenantID string) (
 // ── Agentes (aba "Usuários" do addon combo) ───────────────────────────────
 
 // CreateAgentRequest payload recebido do Next.js pra vincular um profile do
-// workspace como agente numa conta Chatwoot já provisionada.
+// workspace como agente na conta Chatwoot da Cartão Pro.
 type CreateAgentRequest struct {
 	Email string `json:"email"`
 	Name  string `json:"name"`
@@ -763,11 +392,10 @@ type CreateAgentResponse struct {
 
 // generateAgentPassword gera uma senha aleatória forte só pra satisfazer a
 // validação do Devise no CreateUser (config/initializers/secure_password.rb
-// do Chatwoot exige 1 maiúscula, 1 minúscula, 1 número, 1 especial — mesmo
-// padrão já usado em ProvisionAccountForm.tsx no Next.js). Nunca é logada,
-// devolvida ou persistida — só usada dentro do escopo desta chamada. Se o
-// e-mail já existir como User em outra conta da instância, a Platform API
-// ignora esta senha (User.from_email reaproveita o existente).
+// do Chatwoot exige 1 maiúscula, 1 minúscula, 1 número, 1 especial). Nunca é
+// logada, devolvida ou persistida — só usada dentro do escopo desta chamada.
+// Se o e-mail já existir como User em outra conta da instância, a Platform
+// API ignora esta senha (User.from_email reaproveita o existente).
 func generateAgentPassword() (string, error) {
 	const upper = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 	const lower = "abcdefghjkmnpqrstuvwxyz"
@@ -815,10 +443,9 @@ func generateAgentPassword() (string, error) {
 // e, se falhar, só tenta compensar apagando o User globalmente (DeleteUser)
 // quando temos certeza absoluta de que ele acabou de ser criado agora mesmo
 // (user.Accounts veio vazio na resposta do CreateUser) — nunca quando a
-// Platform API reaproveitou um usuário pré-existente (User.from_email),
-// pra não apagar o acesso de alguém a contas que não têm nada a ver com esta
-// operação. Compartilhado entre CreateTenant (bootstrap do combo, tolerante
-// a falha) e CreateAgent (rota nova, exige sucesso).
+// Platform API reaproveitou um usuário pré-existente (User.from_email), pra
+// não apagar o acesso de alguém a contas que não têm nada a ver com esta
+// operação.
 func (s *AdminService) linkOrRollbackAgent(ctx context.Context, accountID int, user *models.ChatwootCreateUserResponse, role string) error {
 	logger := zap.L().With(zap.String("operation", "link_or_rollback_agent"), zap.Int("account_id", accountID), zap.Int("user_id", user.ID))
 
@@ -843,21 +470,14 @@ func (s *AdminService) linkOrRollbackAgent(ctx context.Context, accountID int, u
 	return linkErr
 }
 
-// CreateAgent vincula um profile do workspace como agente numa conta Chatwoot
-// já provisionada (aba "Usuários" do addon combo). Dispara o e-mail nativo
-// de definição de senha do Chatwoot — nunca gera nem devolve senha utilizável
+// CreateAgent vincula um profile do workspace como agente na conta Chatwoot
+// da Cartão Pro (aba "Usuários" do addon combo). Dispara o e-mail nativo de
+// definição de senha do Chatwoot — nunca gera nem devolve senha utilizável
 // (ver generateAgentPassword).
-func (s *AdminService) CreateAgent(ctx context.Context, tenantID string, req CreateAgentRequest) (*CreateAgentResponse, error) {
-	logger := zap.L().With(zap.String("operation", "create_agent"), zap.String("tenant_id", tenantID))
+func (s *AdminService) CreateAgent(ctx context.Context, req CreateAgentRequest) (*CreateAgentResponse, error) {
+	logger := zap.L().With(zap.String("operation", "create_agent"))
 
-	tenant, err := s.tenantRepo.FindByID(ctx, tenantID)
-	if err != nil || tenant == nil {
-		return nil, fmt.Errorf("tenant not found: %w", err)
-	}
-	if tenant.ChatwootAccountID == nil {
-		return nil, fmt.Errorf("tenant %s has no chatwoot account provisioned", tenantID)
-	}
-	accountID := *tenant.ChatwootAccountID
+	accountID := s.chatwoot.AccountID
 
 	role := req.Role
 	if role == "" {
@@ -895,40 +515,14 @@ func (s *AdminService) CreateAgent(ctx context.Context, tenantID string, req Cre
 	}, nil
 }
 
-// RemoveAgent desvincula um agente de uma conta Chatwoot já provisionada —
-// via Application API (mesma rota que o painel do Chatwoot usa), segura por
+// RemoveAgent desvincula um agente da conta Chatwoot da Cartão Pro — via
+// Application API (mesma rota que o painel do Chatwoot usa), segura por
 // desenho (só apaga o User globalmente se ele não tiver mais nenhum outro
 // vínculo). 404 é tratado como sucesso pelo cliente (agente já não existia
 // mais na conta).
-func (s *AdminService) RemoveAgent(ctx context.Context, tenantID string, agentID int) error {
-	logger := zap.L().With(zap.String("operation", "remove_agent"), zap.String("tenant_id", tenantID), zap.Int("agent_id", agentID))
-
-	tenant, err := s.tenantRepo.FindByID(ctx, tenantID)
-	if err != nil || tenant == nil {
-		return fmt.Errorf("tenant not found: %w", err)
-	}
-	if tenant.ChatwootAccountID == nil {
-		return fmt.Errorf("tenant %s has no chatwoot account provisioned", tenantID)
-	}
-	accountID := *tenant.ChatwootAccountID
-
-	accountToken := ""
-	if tenant.ChatwootAPIToken != nil && *tenant.ChatwootAPIToken != "" {
-		accountToken = *tenant.ChatwootAPIToken
-	} else {
-		for i := 0; i < 3; i++ {
-			token, tokenErr := s.chatwootAdmin.GetAccountAccessToken(ctx, accountID)
-			if tokenErr == nil {
-				accountToken = token
-				break
-			}
-			logger.Warn("failed to get account access token, will retry", zap.Error(tokenErr))
-			time.Sleep(2 * time.Second)
-		}
-	}
-	if accountToken == "" {
-		return fmt.Errorf("failed to obtain chatwoot access token for account %d", accountID)
-	}
+func (s *AdminService) RemoveAgent(ctx context.Context, agentID int) error {
+	accountID := s.chatwoot.AccountID
+	accountToken := s.chatwoot.APIToken
 
 	if err := s.chatwootAdmin.RemoveAgentFromAccount(ctx, accountID, agentID, accountToken); err != nil {
 		return fmt.Errorf("failed to remove agent from account: %w", err)
@@ -938,7 +532,7 @@ func (s *AdminService) RemoveAgent(ctx context.Context, tenantID string, agentID
 
 // RunWebhookHealthChecker verifica periodicamente se o campo webhook está configurado
 // em todas as instâncias da Evolution GO. Se encontrar webhook vazio, chama
-// ReconnectInstance para restaurá-lo automaticamente.
+// reconfigureWebhook para restaurá-lo automaticamente.
 func (s *AdminService) RunWebhookHealthChecker(ctx context.Context, interval time.Duration) {
 	logger := zap.L().With(zap.String("component", "webhook_health_checker"))
 	logger.Info("webhook health checker started", zap.Duration("interval", interval))
@@ -996,24 +590,6 @@ func (s *AdminService) checkAllWebhooks(ctx context.Context) {
 					logger.Error("health check: failed to update instance status to disconnected", zap.Error(err))
 				} else {
 					logger.Info("health check: instance disconnected, updating status", zap.String("instance", full.InstanceName))
-					if s.callbackService != nil {
-						// Precisamos do workspace_id do tenant
-						var workspaceID string
-						tenant, err := s.tenantRepo.FindByID(ctx, full.TenantID)
-						if err == nil && tenant != nil && tenant.WorkspaceID != nil {
-							workspaceID = *tenant.WorkspaceID
-						}
-						payload := CallbackPayload{
-							EventType:    "connection.close",
-							TenantID:     full.TenantID,
-							WorkspaceID:  workspaceID,
-							InstanceName: full.InstanceName,
-							Status:       "disconnected",
-							Reason:       "connection_closed",
-							SentAt:       time.Now().UTC(),
-						}
-						s.callbackService.Notify(ctx, payload)
-					}
 				}
 			} else if info.Connected && full.Status != "connected" {
 				// (B) Se a instância retornar Connected: true na Evolution GO E o banco tiver status != "connected"
@@ -1030,28 +606,82 @@ func (s *AdminService) checkAllWebhooks(ctx context.Context) {
 		logger.Warn("health check: webhook missing — triggering reconnect",
 			zap.String("instance", full.InstanceName),
 			zap.String("instance_id", full.InstanceID),
-			zap.String("tenant_id", full.TenantID),
 		)
-		if err := s.ReconnectInstance(ctx, full.TenantID, ""); err != nil {
+		if err := s.reconfigureWebhook(ctx, full.InstanceName, ""); err != nil {
 			logger.Error("health check: reconnect failed",
 				zap.String("instance", full.InstanceName),
-				zap.String("tenant_id", full.TenantID),
 				zap.Error(err),
 			)
 		} else {
 			logger.Info("health check: webhook restored",
 				zap.String("instance", full.InstanceName),
-				zap.String("tenant_id", full.TenantID),
 			)
 		}
 	}
 }
 
-// ReconnectByInstanceName triggers QR code generation for the instance identified by its name.
-// It calls POST /instance/reconnect on Evolution GO (forcing a new QR), then polls
-// GET /instance/qr directly — no webhook dependency. Returns the QR base64 when ready.
-func (s *AdminService) ReconnectByInstanceName(ctx context.Context, instanceName string) (qrBase64 string, err error) {
+// reconfigureWebhook (re)configura o webhook na Evolution GO para a instância
+// dada, sem gerar QR novo — usado internamente pelo health checker e como
+// primeiro passo de ReconnectByInstanceName (fluxo público /connect). Se
+// tokenOverride não for vazio, atualiza o APIKey no banco antes de reconectar.
+func (s *AdminService) reconfigureWebhook(ctx context.Context, instanceName string, tokenOverride string) error {
+	logger := zap.L().With(zap.String("instance", instanceName))
+
+	instance, err := s.instanceRepo.FindByInstanceName(ctx, instanceName)
+	if err != nil {
+		return fmt.Errorf("instance not found: %w", err)
+	}
+
+	if tokenOverride != "" {
+		instance.APIKey = &tokenOverride
+		if err := s.instanceRepo.Update(ctx, instance); err != nil {
+			logger.Warn("failed to update instance token in DB", zap.Error(err))
+		} else {
+			logger.Info("instance token updated in DB", zap.String("instance", instance.InstanceName))
+		}
+	}
+
+	expandedWebhookBase := os.ExpandEnv(s.webhookBaseURL)
+	webhookSecret := os.Getenv("WEBHOOK_SECRET_EVOLUTION")
+	webhookUrl := fmt.Sprintf("%s/webhook/evolution?instance=%s", expandedWebhookBase, instance.InstanceName)
+	if webhookSecret != "" {
+		webhookUrl += "&token=" + webhookSecret
+	}
+
+	connectReq := models.EvolutionConnectRequest{
+		Immediate:  false,
+		WebhookUrl: webhookUrl,
+		Subscribe: []string{
+			"MESSAGE",
+			"CONNECTION",
+			"QRCODE",
+		},
+	}
+
+	logger.Info("reconnecting evolution instance",
+		zap.String("instance", instance.InstanceName),
+		zap.String("instance_id", instance.InstanceID),
+		zap.String("webhook_url", webhookUrl),
+	)
+
+	if err := s.evolution.ConnectInstance(ctx, *instance.APIKey, connectReq); err != nil {
+		return fmt.Errorf("failed to reconnect instance: %w", err)
+	}
+
+	return nil
+}
+
+// ReconnectByInstanceName é o único fluxo público de reconexão de instância
+// (POST /api/v1/instances/{instanceName}/connect). Reconfigura o webhook
+// (reconfigureWebhook — mesma lógica usada pelo health checker automático),
+// opcionalmente troca o token da instância primeiro, e então força a geração
+// de um novo QR Code, tentando devolvê-lo inline (até 15s de polling).
+func (s *AdminService) ReconnectByInstanceName(ctx context.Context, instanceName string, tokenOverride string) (qrBase64 string, err error) {
 	logger := zap.L().With(zap.String("instance_name", instanceName))
+
+	if err := s.reconfigureWebhook(ctx, instanceName, tokenOverride); err != nil {
+		return "", err
+	}
 
 	instance, err := s.instanceRepo.FindByInstanceName(ctx, instanceName)
 	if err != nil {
@@ -1063,7 +693,7 @@ func (s *AdminService) ReconnectByInstanceName(ctx context.Context, instanceName
 
 	// Verifica se a instância já está conectada na Evolution GO antes de iniciar um novo fluxo de QR.
 	if info, err := s.evolution.GetInstanceInfo(ctx, instance.InstanceID); err == nil && info != nil && info.Connected {
-		logger.Info("instance already connected in Evolution GO, skipping reconnect/QR generation", zap.String("instance", instanceName))
+		logger.Info("instance already connected in Evolution GO, skipping QR generation", zap.String("instance", instanceName))
 		if instance.Status != "connected" {
 			instance.Status = "connected"
 			if updateErr := s.instanceRepo.Update(ctx, instance); updateErr != nil {
@@ -1073,36 +703,11 @@ func (s *AdminService) ReconnectByInstanceName(ctx context.Context, instanceName
 		return "ALREADY_CONNECTED", nil
 	}
 
-	logger.Info("triggering QR code generation via Evolution reconnect",
-		zap.String("instance", instanceName),
-	)
-
-	// Passo 1: Connect explícito — dispara a geração do QR Code na Evolution.
-	// Immediate=false inicia o fluxo de QR sem tentar restaurar sessão existente.
-	// Não fazemos logout antes: o logout dispara um webhook LoggedOut que vira um
-	// callback connection.close/logout para o Linkko, derrubando a jornada do QR.
-	expandedWebhookBase := os.ExpandEnv(s.webhookBaseURL)
-	webhookSecret := os.Getenv("WEBHOOK_SECRET_EVOLUTION")
-	webhookUrl := fmt.Sprintf("%s/webhook/evolution?instance=%s&tenant=%s",
-		expandedWebhookBase, instance.InstanceName, instance.TenantID)
-	if webhookSecret != "" {
-		webhookUrl += "&token=" + webhookSecret
-	}
-	connectReq := models.EvolutionConnectRequest{
-		Immediate:  false,
-		WebhookUrl: webhookUrl,
-		Subscribe:  []string{"MESSAGE", "CONNECTION", "QRCODE"},
-	}
-	logger.Info("enviando comando Connect para a Evolution", zap.String("webhook_url", webhookUrl))
-	if err := s.evolution.ConnectInstance(ctx, *instance.APIKey, connectReq); err != nil {
-		logger.Error("connect instance failed", zap.Error(err))
-		return "", fmt.Errorf("failed to connect instance: %w", err)
-	}
-	logger.Info("Connect enviado — forçando geração de QR via reconnect")
+	logger.Info("triggering QR code generation via Evolution reconnect", zap.String("instance", instanceName))
 
 	// Passo 1.5: POST /instance/reconnect para garantir geração de QR em cold start.
-	// Connect(Immediate:false) configura o webhook mas pode não disparar o QR
-	// imediatamente após logout completo. Reconnect força o processo explicitamente.
+	// reconfigureWebhook (Immediate=false) configura o webhook mas pode não disparar
+	// o QR imediatamente após logout completo. Reconnect força o processo explicitamente.
 	// Não faz logout interno (diferente de ForceLogoutInstance) — seguro chamar aqui.
 	if err := s.evolution.ReconnectEvolutionInstance(ctx, *instance.APIKey); err != nil {
 		logger.Warn("reconnect instance returned error (non-fatal, prosseguindo com poll)", zap.Error(err))
@@ -1187,8 +792,7 @@ func (s *AdminService) RecreateInstance(ctx context.Context, instanceName string
 	// no próximo TriggerConnect chamado pelo cliente para gerar o QR Code.
 	expandedWebhookBase := os.ExpandEnv(s.webhookBaseURL)
 	webhookSecret := os.Getenv("WEBHOOK_SECRET_EVOLUTION")
-	webhookURL := fmt.Sprintf("%s/webhook/evolution?instance=%s&tenant=%s",
-		expandedWebhookBase, instance.InstanceName, instance.TenantID)
+	webhookURL := fmt.Sprintf("%s/webhook/evolution?instance=%s", expandedWebhookBase, instance.InstanceName)
 	if webhookSecret != "" {
 		webhookURL += "&token=" + webhookSecret
 	}
@@ -1234,54 +838,5 @@ func (s *AdminService) ForceLogoutInstance(ctx context.Context, instanceName str
 	}
 
 	logger.Info("instance force-logged out successfully")
-	return nil
-}
-
-// ReconnectInstance reconfigura o webhook na Evolution GO para a instância do tenant.
-// Se tokenOverride não for vazio, atualiza o APIKey no banco antes de reconectar.
-func (s *AdminService) ReconnectInstance(ctx context.Context, tenantID string, tokenOverride string) error {
-	logger := zap.L().With(zap.String("tenant_id", tenantID))
-
-	instance, err := s.instanceRepo.FindDefaultByTenantID(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("instance not found for tenant: %w", err)
-	}
-
-	if tokenOverride != "" {
-		instance.APIKey = &tokenOverride
-		if err := s.instanceRepo.Update(ctx, instance); err != nil {
-			logger.Warn("failed to update instance token in DB", zap.Error(err))
-		} else {
-			logger.Info("instance token updated in DB", zap.String("instance", instance.InstanceName))
-		}
-	}
-
-	expandedWebhookBase := os.ExpandEnv(s.webhookBaseURL)
-	webhookSecret := os.Getenv("WEBHOOK_SECRET_EVOLUTION")
-	webhookUrl := fmt.Sprintf("%s/webhook/evolution?instance=%s&tenant=%s", expandedWebhookBase, instance.InstanceName, tenantID)
-	if webhookSecret != "" {
-		webhookUrl += "&token=" + webhookSecret
-	}
-
-	connectReq := models.EvolutionConnectRequest{
-		Immediate:  false,
-		WebhookUrl: webhookUrl,
-		Subscribe: []string{
-			"MESSAGE",
-			"CONNECTION",
-			"QRCODE",
-		},
-	}
-
-	logger.Info("reconnecting evolution instance",
-		zap.String("instance", instance.InstanceName),
-		zap.String("instance_id", instance.InstanceID),
-		zap.String("webhook_url", webhookUrl),
-	)
-
-	if err := s.evolution.ConnectInstance(ctx, *instance.APIKey, connectReq); err != nil {
-		return fmt.Errorf("failed to reconnect instance: %w", err)
-	}
-
 	return nil
 }

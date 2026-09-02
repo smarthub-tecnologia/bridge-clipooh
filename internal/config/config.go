@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -15,7 +16,6 @@ type Config struct {
 	Templates map[string]string `mapstructure:"templates"`
 	Queue     QueueConfig       `mapstructure:"queue"`
 	Policy    PolicyConfig      `mapstructure:"policy"`
-	Callbacks CallbacksConfig   `mapstructure:"callbacks"`
 }
 
 type QueueConfig struct {
@@ -29,22 +29,22 @@ type PolicyConfig struct {
 	WarmupDays               int `mapstructure:"warmup_days"`
 	WarmupMaxMessagesPerDay  int `mapstructure:"warmup_max_messages_per_day"`
 	RecipientCooldownSeconds int `mapstructure:"recipient_cooldown_seconds"`
-	TenantRateLimit          int `mapstructure:"tenant_rate_limit"`
-}
-
-type CallbacksConfig struct {
-	DirectusWebhookURL    string `mapstructure:"directus_webhook_url"`
-	DirectusWebhookSecret string `mapstructure:"directus_webhook_secret"`
-	Enabled               bool   `mapstructure:"enabled"`
 }
 
 type ServerConfig struct {
 	Port string
 }
 
+// ChatwootConfig — a Cartão Pro é a única conta Chatwoot que este bridge serve.
+// AccountID/APIToken/WebhookSecret/InternalURL substituem o que antes vinha
+// da tabela `tenants` (agora removida); são fixos por deploy, lidos de env vars.
 type ChatwootConfig struct {
-	AdminAPIURL string `mapstructure:"admin_api_url"`
-	WebhookBase string `mapstructure:"webhook_base"`
+	AdminAPIURL   string `mapstructure:"admin_api_url"`
+	WebhookBase   string `mapstructure:"webhook_base"`
+	AccountID     int
+	APIToken      string
+	WebhookSecret string
+	InternalURL   string
 }
 
 type EvolutionConfig struct {
@@ -59,6 +59,11 @@ var RequiredVars = []string{
 	"EVOLUTION_BASE_URL",
 	"ADMIN_API_KEY",
 	"BRIDGE_API_KEY",
+	// Config fixa da única conta Chatwoot (Cartão Pro) — substituem a antiga
+	// tabela `tenants`, removida na migração 018_remove_tenant_multitenancy.
+	"CHATWOOT_ACCOUNT_ID",
+	"CHATWOOT_API_TOKEN",
+	"CHATWOOT_WEBHOOK_SECRET",
 }
 
 // WarnVars são variáveis ausentes que degradam funcionalidade mas não impedem o boot.
@@ -105,11 +110,6 @@ func LoadConfig(path string) (*Config, error) {
 	// Allow overriding nested keys, e.g. CHATWOOT_ADMIN_API_URL instead of CHATWOOT.ADMIN_API_URL
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 
-	// Bind env vars explicitly to allow viper.Unmarshal to read them for callbacks
-	_ = viper.BindEnv("callbacks.directus_webhook_url", "CALLBACKS_DIRECTUS_WEBHOOK_URL")
-	_ = viper.BindEnv("callbacks.directus_webhook_secret", "CALLBACKS_DIRECTUS_WEBHOOK_SECRET")
-	_ = viper.BindEnv("callbacks.enabled", "CALLBACKS_ENABLED")
-
 	viper.SetDefault("policy.default_max_messages_per_day", 200)
 	viper.SetDefault("policy.warmup_max_messages_per_day", 40)
 	viper.SetDefault("policy.warmup_days", 7)
@@ -151,6 +151,30 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Chatwoot.WebhookBase == "" || strings.HasPrefix(cfg.Chatwoot.WebhookBase, "${") {
 		// Fallback para o nome antigo
 		cfg.Chatwoot.WebhookBase = viper.GetString("CHATWOOT_WEBHOOK_BASE")
+	}
+
+	// Config fixa da única conta Chatwoot (Cartão Pro) — sem tenants, é lida
+	// direto das env vars, sem passar pelo config.yaml.
+	cfg.Chatwoot.APIToken = os.Getenv("CHATWOOT_API_TOKEN")
+	// CHATWOOT_WEBHOOK_SECRET não tem endpoint de rotação em tempo de execução
+	// (não há mais tabela de tenant pra persistir um valor atualizado — ver
+	// migration 018_remove_tenant_multitenancy). Rotacionar o secret HMAC do
+	// webhook Chatwoot é: gerar/copiar o novo valor na inbox do Chatwoot,
+	// atualizar esta env var e reiniciar o processo.
+	cfg.Chatwoot.WebhookSecret = os.Getenv("CHATWOOT_WEBHOOK_SECRET")
+	if v := os.Getenv("CHATWOOT_ACCOUNT_ID"); v != "" {
+		id, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CHATWOOT_ACCOUNT_ID (must be numeric): %w", err)
+		}
+		cfg.Chatwoot.AccountID = id
+	}
+	// Tenta CHATWOOT_BASE_URL primeiro (URL pública), cai para CHATWOOT_INTERNAL_URL
+	// (Docker) — mesma precedência que o antigo Tenant.ChatwootInternalURL().
+	if url := os.Getenv("CHATWOOT_BASE_URL"); url != "" {
+		cfg.Chatwoot.InternalURL = url
+	} else {
+		cfg.Chatwoot.InternalURL = os.Getenv("CHATWOOT_INTERNAL_URL")
 	}
 
 	return &cfg, nil

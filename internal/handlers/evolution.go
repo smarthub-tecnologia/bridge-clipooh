@@ -42,7 +42,6 @@ func (h *EvolutionHandler) HandleWebhook(w http.ResponseWriter, r *http.Request)
 		zap.String("method", r.Method),
 		zap.String("remote_addr", r.RemoteAddr),
 		zap.String("instance", r.URL.Query().Get("instance")),
-		zap.String("tenant", r.URL.Query().Get("tenant")),
 		zap.Bool("token_in_query", r.URL.Query().Get("token") != ""),
 	)
 
@@ -81,14 +80,13 @@ func (h *EvolutionHandler) HandleWebhook(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Injeta instance e tenant dos query params na struct do webhook
+	// Injeta instance do query param na struct do webhook — resolução é 100%
+	// por instance_name agora, não há mais ?tenant= na URL.
 	webhook.InstanceName = r.URL.Query().Get("instance")
-	webhook.TenantID = r.URL.Query().Get("tenant")
 
 	logger.Info("evolution webhook parsed",
 		zap.String("event", webhook.Event),
 		zap.String("instance", webhook.InstanceName),
-		zap.String("tenant", webhook.TenantID),
 	)
 
 	// Processa o webhook

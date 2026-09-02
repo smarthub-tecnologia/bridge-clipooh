@@ -40,48 +40,21 @@ func buildIntegrationRouter(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// metaCallbackCollector returns an httptest.Server that streams every received
-// callback into a buffered channel and counts total calls.
-func metaCallbackCollector(t *testing.T) (*httptest.Server, chan map[string]interface{}, *atomic.Int32) {
-	t.Helper()
-	ch := make(chan map[string]interface{}, 10)
-	var hits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		var m map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&m)
-		ch <- m
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(srv.Close)
-	return srv, ch, &hits
-}
-
-// receiveCallback blocks until the next callback arrives or the 2-second
-// timeout expires.
-func receiveCallback(t *testing.T, ch <-chan map[string]interface{}, label string) map[string]interface{} {
-	t.Helper()
-	select {
-	case m := <-ch:
-		return m
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for %s callback", label)
-		return nil
-	}
-}
-
 // ── Integration test 1 ────────────────────────────────────────────────────────
 //
-// Full success cycle: send → "sent" callback (from notify_meta) → webhook
-// "delivered" → "delivered" callback (from meta_webhook).
+// Full success cycle: send → "sent" logged (from notify_meta) → webhook
+// "delivered" → "delivered" logged (from meta_webhook). The bridge no longer
+// notifies any external platform (Directus/Linkko) — the only observable
+// outcome of each step is a structured log entry plus, for the send step,
+// the wamidstore mapping used to correlate the later webhook.
 
 func TestIntegration_MetaFullCycle_Success(t *testing.T) {
 	t.Setenv("BRIDGE_API_KEY", "int-bridge-key")
-	t.Setenv("CALLBACKS_ENABLED", "true")
+	t.Setenv("META_APP_SECRET", testMetaAppSecret)
 
 	// Mock Meta Graph API — returns minimal 200 OK without conversation fields,
 	// because in production those come from webhook statuses, not the send
-	// response. The "sent" callback from notify_meta will therefore have
+	// response. The "sent" log entry from notify_meta will therefore have
 	// conversation_id="" and conversation_origin="".
 	var metaHits atomic.Int32
 	metaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -109,118 +82,121 @@ func TestIntegration_MetaFullCycle_Success(t *testing.T) {
 	}
 	defer func() { getInstanceIDByPhoneNumberIDFn = origPhoneFn }()
 
-	cbSrv, cbCh, cbHits := metaCallbackCollector(t)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-
 	apiSrv := buildIntegrationRouter(t)
 
-	// Step 1: POST /api/v1/notify/send → 202.
-	sendBody := `{"provider":"meta","instance":"int-success-001","to":"11987654321","event_id":"evt-int-001","meta":{"template_name":"hello_world","language_code":"pt_BR"}}`
-	req, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/notify/send", strings.NewReader(sendBody))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer int-bridge-key")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("send request: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected 202, got %d", resp.StatusCode)
-	}
+	sendDone, sendSignal := waitOnce()
+	prevSendHook := afterMetaSend
+	afterMetaSend = sendSignal
+	defer func() { afterMetaSend = prevSendHook }()
 
-	// Step 2: Wait for "sent" callback from notify_meta goroutine.
-	sent := receiveCallback(t, cbCh, "sent")
+	webhookDone, webhookSignal := waitOnce()
+	prevWebhookHook := afterMetaWebhookEvent
+	afterMetaWebhookEvent = webhookSignal
+	defer func() { afterMetaWebhookEvent = prevWebhookHook }()
 
-	if sent["event"] != "sent" {
-		t.Errorf("event = %v, want sent", sent["event"])
+	logs := withObservedLogs(func() {
+		// Step 1: POST /api/v1/notify/send → 202.
+		sendBody := `{"provider":"meta","instance":"int-success-001","to":"11987654321","event_id":"evt-int-001","meta":{"template_name":"hello_world","language_code":"pt_BR"}}`
+		req, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/notify/send", strings.NewReader(sendBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer int-bridge-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("send request: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 202, got %d", resp.StatusCode)
+		}
+
+		// Step 2: Wait for the notify_meta goroutine to finish.
+		waitFor(t, sendDone)
+
+		// Step 3: POST /api/v1/meta/webhook with delivered status → 200.
+		webhookPayload := `{
+			"entry": [{
+				"changes": [{
+					"value": {
+						"metadata": {"phone_number_id": "12345670001"},
+						"statuses": [{
+							"id": "wamid.inttest001",
+							"status": "delivered",
+							"timestamp": "1715000100"
+						}]
+					}
+				}]
+			}]
+		}`
+		wReq, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/meta/webhook", strings.NewReader(webhookPayload))
+		wReq.Header.Set("Content-Type", "application/json")
+		wReq.Header.Set("X-Hub-Signature-256", metaSig(webhookPayload, testMetaAppSecret))
+		wResp, err := http.DefaultClient.Do(wReq)
+		if err != nil {
+			t.Fatalf("webhook request: %v", err)
+		}
+		wResp.Body.Close()
+		if wResp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200 for webhook, got %d", wResp.StatusCode)
+		}
+
+		// Step 4: Wait for the meta_webhook goroutine to finish.
+		waitFor(t, webhookDone)
+	})
+
+	sent := findLog(logs, "meta send: sent")
+	if sent == nil {
+		t.Fatal("expected a 'meta send: sent' log entry")
 	}
-	if sent["event_id"] != "evt-int-001" {
-		t.Errorf("event_id = %v, want evt-int-001", sent["event_id"])
+	sentFields := sent.ContextMap()
+	if sentFields["event_id"] != "evt-int-001" {
+		t.Errorf("event_id = %v, want evt-int-001", sentFields["event_id"])
 	}
-	if sent["wamid"] != "wamid.inttest001" {
-		t.Errorf("wamid = %v, want wamid.inttest001", sent["wamid"])
+	if sentFields["wamid"] != "wamid.inttest001" {
+		t.Errorf("wamid = %v, want wamid.inttest001", sentFields["wamid"])
 	}
-	if sent["provider"] != "meta" {
-		t.Errorf("provider = %v, want meta", sent["provider"])
-	}
-	if sent["phone_number_id"] != "12345670001" {
-		t.Errorf("phone_number_id = %v, want 12345670001", sent["phone_number_id"])
+	if sentFields["phone_number_id"] != "12345670001" {
+		t.Errorf("phone_number_id = %v, want 12345670001", sentFields["phone_number_id"])
 	}
 	// conversation_id and conversation_origin must be present but empty —
 	// the Meta 200 OK does not carry these fields; they arrive only via
 	// webhook statuses[].status="sent".
-	if v, _ := sent["conversation_id"].(string); v != "" {
+	if v, _ := sentFields["conversation_id"].(string); v != "" {
 		t.Errorf("conversation_id = %q, want empty string (sent response carries no conversation)", v)
 	}
-	if v, _ := sent["conversation_origin"].(string); v != "" {
+	if v, _ := sentFields["conversation_origin"].(string); v != "" {
 		t.Errorf("conversation_origin = %q, want empty string (sent response carries no conversation)", v)
 	}
 
-	// Step 3: Verify wamid → event_id mapping was stored before the callback.
+	// Step 5: Verify wamid → event_id mapping was stored before the log entry.
 	if _, ok := wamidstore.Get("wamid.inttest001"); !ok {
-		t.Error("wamidstore.Get(wamid.inttest001): expected ok=true after sent callback")
+		t.Error("wamidstore.Get(wamid.inttest001): expected ok=true after send")
 	}
 
-	// Step 4: POST /api/v1/meta/webhook with delivered status → 200.
-	webhookPayload := `{
-		"entry": [{
-			"changes": [{
-				"value": {
-					"metadata": {"phone_number_id": "12345670001"},
-					"statuses": [{
-						"id": "wamid.inttest001",
-						"status": "delivered",
-						"timestamp": "1715000100"
-					}]
-				}
-			}]
-		}]
-	}`
-	wReq, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/meta/webhook", strings.NewReader(webhookPayload))
-	wReq.Header.Set("Content-Type", "application/json")
-	wResp, err := http.DefaultClient.Do(wReq)
-	if err != nil {
-		t.Fatalf("webhook request: %v", err)
+	delivered := findLog(logs, "meta message status: delivered")
+	if delivered == nil {
+		t.Fatal("expected a 'meta message status: delivered' log entry")
 	}
-	wResp.Body.Close()
-	if wResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 for webhook, got %d", wResp.StatusCode)
+	deliveredFields := delivered.ContextMap()
+	if deliveredFields["event_id"] != "evt-int-001" {
+		t.Errorf("event_id = %v, want evt-int-001", deliveredFields["event_id"])
 	}
-
-	// Step 5: Wait for "delivered" callback from meta_webhook goroutine.
-	delivered := receiveCallback(t, cbCh, "delivered")
-
-	if delivered["event"] != "delivered" {
-		t.Errorf("event = %v, want delivered", delivered["event"])
-	}
-	if delivered["event_id"] != "evt-int-001" {
-		t.Errorf("event_id = %v, want evt-int-001", delivered["event_id"])
-	}
-	if delivered["provider"] != "meta" {
-		t.Errorf("provider = %v, want meta", delivered["provider"])
-	}
-	deliveredAt, _ := delivered["delivered_at"].(string)
+	deliveredAt, _ := deliveredFields["delivered_at"].(string)
 	if _, parseErr := time.Parse(time.RFC3339, deliveredAt); parseErr != nil {
 		t.Errorf("delivered_at %q is not RFC3339: %v", deliveredAt, parseErr)
 	}
 
-	// Step 6: Cardinality assertions.
 	if n := metaHits.Load(); n != 1 {
 		t.Errorf("Meta API received %d requests, want exactly 1", n)
-	}
-	if n := cbHits.Load(); n != 2 {
-		t.Errorf("callback received %d calls, want exactly 2 (sent + delivered)", n)
 	}
 }
 
 // ── Integration test 2 ────────────────────────────────────────────────────────
 //
-// Token error: Meta returns 400 code:190 → "blocked_meta_error" callback with
-// wamid=null and reason="invalid_token".
+// Token error: Meta returns 400 code:190 → "meta send blocked" log entry with
+// reason="invalid_token" and no wamid (nothing to store).
 
 func TestIntegration_MetaFullCycle_TokenError(t *testing.T) {
 	t.Setenv("BRIDGE_API_KEY", "int-bridge-key")
-	t.Setenv("CALLBACKS_ENABLED", "true")
 
 	// Mock Meta Graph API — returns 400 OAuthException.
 	metaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -245,54 +221,54 @@ func TestIntegration_MetaFullCycle_TokenError(t *testing.T) {
 	}
 	defer func() { getMetaConfigFn = origCfgFn }()
 
-	cbSrv, cbCh, _ := metaCallbackCollector(t)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-
 	apiSrv := buildIntegrationRouter(t)
 
-	sendBody := `{"provider":"meta","instance":"int-error-001","to":"11987654322","event_id":"evt-int-002","meta":{"template_name":"hello_world","language_code":"pt_BR"}}`
-	req, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/notify/send", strings.NewReader(sendBody))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer int-bridge-key")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("send request: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("expected 202, got %d", resp.StatusCode)
-	}
+	done, signal := waitOnce()
+	prevHook := afterMetaSend
+	afterMetaSend = signal
+	defer func() { afterMetaSend = prevHook }()
 
-	blocked := receiveCallback(t, cbCh, "blocked_meta_error")
+	logs := withObservedLogs(func() {
+		sendBody := `{"provider":"meta","instance":"int-error-001","to":"11987654322","event_id":"evt-int-002","meta":{"template_name":"hello_world","language_code":"pt_BR"}}`
+		req, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/notify/send", strings.NewReader(sendBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer int-bridge-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("send request: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("expected 202, got %d", resp.StatusCode)
+		}
 
-	if blocked["event"] != "blocked_meta_error" {
-		t.Errorf("event = %v, want blocked_meta_error", blocked["event"])
+		waitFor(t, done)
+	})
+
+	blocked := findLog(logs, "meta send blocked: meta api error")
+	if blocked == nil {
+		t.Fatal("expected a 'meta send blocked: meta api error' log entry")
 	}
-	if blocked["reason"] != "invalid_token" {
-		t.Errorf("reason = %v, want invalid_token", blocked["reason"])
+	fields := blocked.ContextMap()
+	if fields["reason"] != "invalid_token" {
+		t.Errorf("reason = %v, want invalid_token", fields["reason"])
 	}
-	code, ok := blocked["meta_error_code"].(float64)
-	if !ok || code != 190 {
-		t.Errorf("meta_error_code = %v, want 190", blocked["meta_error_code"])
+	metaErrorCode, ok := fields["meta_error_code"].(int64)
+	if !ok || metaErrorCode != 190 {
+		t.Errorf("meta_error_code = %v, want 190", fields["meta_error_code"])
 	}
-	if blocked["wamid"] != nil {
-		t.Errorf("wamid must be JSON null, got %v", blocked["wamid"])
-	}
-	if blocked["provider"] != "meta" {
-		t.Errorf("provider = %v, want meta", blocked["provider"])
-	}
-	if blocked["phone_number_id"] != "12345670002" {
-		t.Errorf("phone_number_id = %v, want 12345670002", blocked["phone_number_id"])
+	if fields["phone_number_id"] != "12345670002" {
+		t.Errorf("phone_number_id = %v, want 12345670002", fields["phone_number_id"])
 	}
 }
 
 // ── Integration test 3 ────────────────────────────────────────────────────────
 //
-// Inbound message: the lead replies → webhook delivers "message.received"
-// callback with full reply sub-object and correct event_id traceability.
+// Inbound message: the lead replies → webhook logs "meta message received"
+// with full reply fields and correct event_id traceability.
 
 func TestIntegration_MetaFullCycle_InboundMessage(t *testing.T) {
-	t.Setenv("CALLBACKS_ENABLED", "true")
+	t.Setenv("META_APP_SECRET", testMetaAppSecret)
 
 	// Simulate a wamid stored from a previous outbound send.
 	wamidstore.Set("wamid.inbound-int001", "evt-original-int123")
@@ -303,71 +279,70 @@ func TestIntegration_MetaFullCycle_InboundMessage(t *testing.T) {
 	}
 	defer func() { getInstanceIDByPhoneNumberIDFn = origPhoneFn }()
 
-	cbSrv, cbCh, _ := metaCallbackCollector(t)
-	t.Setenv("CALLBACKS_DIRECTUS_WEBHOOK_URL", cbSrv.URL)
-
 	apiSrv := buildIntegrationRouter(t)
 
-	webhookPayload := `{
-		"entry": [{
-			"changes": [{
-				"value": {
-					"metadata": {"phone_number_id": "12345670003"},
-					"messages": [{
-						"id":        "wamid.inbound-int001",
-						"from":      "5511999999999",
-						"timestamp": "1715000200",
-						"type":      "text",
-						"text":      {"body": "Quero saber mais"}
-					}]
-				}
+	done, signal := waitOnce()
+	prevHook := afterMetaWebhookEvent
+	afterMetaWebhookEvent = signal
+	defer func() { afterMetaWebhookEvent = prevHook }()
+
+	logs := withObservedLogs(func() {
+		webhookPayload := `{
+			"entry": [{
+				"changes": [{
+					"value": {
+						"metadata": {"phone_number_id": "12345670003"},
+						"messages": [{
+							"id":        "wamid.inbound-int001",
+							"from":      "5511999999999",
+							"timestamp": "1715000200",
+							"type":      "text",
+							"text":      {"body": "Quero saber mais"}
+						}]
+					}
+				}]
 			}]
-		}]
-	}`
+		}`
 
-	req, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/meta/webhook", strings.NewReader(webhookPayload))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("webhook request: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
+		req, _ := http.NewRequest(http.MethodPost, apiSrv.URL+"/api/v1/meta/webhook", strings.NewReader(webhookPayload))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Hub-Signature-256", metaSig(webhookPayload, testMetaAppSecret))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("webhook request: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
 
-	cb := receiveCallback(t, cbCh, "message.received")
+		waitFor(t, done)
+	})
 
-	if cb["event"] != "message.received" {
-		t.Errorf("event = %v, want message.received", cb["event"])
+	entry := findLog(logs, "meta message received")
+	if entry == nil {
+		t.Fatal("expected a 'meta message received' log entry")
 	}
-	if cb["event_id"] != "evt-original-int123" {
-		t.Errorf("event_id = %v, want evt-original-int123 (end-to-end traceability)", cb["event_id"])
+	fields := entry.ContextMap()
+	if fields["event_id"] != "evt-original-int123" {
+		t.Errorf("event_id = %v, want evt-original-int123 (end-to-end traceability)", fields["event_id"])
 	}
-	if cb["instance_id"] != "linkko-int-prod" {
-		t.Errorf("instance_id = %v, want linkko-int-prod", cb["instance_id"])
+	if fields["instance_id"] != "linkko-int-prod" {
+		t.Errorf("instance_id = %v, want linkko-int-prod", fields["instance_id"])
 	}
-	if cb["provider"] != "meta" {
-		t.Errorf("provider = %v, want meta", cb["provider"])
+	if fields["phone_number_id"] != "12345670003" {
+		t.Errorf("phone_number_id = %v, want 12345670003", fields["phone_number_id"])
 	}
-	if cb["phone_number_id"] != "12345670003" {
-		t.Errorf("phone_number_id = %v, want 12345670003", cb["phone_number_id"])
+	if fields["from"] != "5511999999999" {
+		t.Errorf("from = %v, want 5511999999999", fields["from"])
 	}
-
-	reply, _ := cb["reply"].(map[string]interface{})
-	if reply == nil {
-		t.Fatal("reply field missing from message.received callback")
+	if fields["text"] != "Quero saber mais" {
+		t.Errorf("text = %v, want 'Quero saber mais'", fields["text"])
 	}
-	if reply["from"] != "5511999999999" {
-		t.Errorf("reply.from = %v, want 5511999999999", reply["from"])
+	if fields["message_type"] != "text" {
+		t.Errorf("message_type = %v, want text", fields["message_type"])
 	}
-	if reply["text"] != "Quero saber mais" {
-		t.Errorf("reply.text = %v, want 'Quero saber mais'", reply["text"])
-	}
-	if reply["message_type"] != "text" {
-		t.Errorf("reply.message_type = %v, want text", reply["message_type"])
-	}
-	replyAt, _ := reply["reply_at"].(string)
+	replyAt, _ := fields["reply_at"].(string)
 	if _, parseErr := time.Parse(time.RFC3339, replyAt); parseErr != nil {
 		t.Errorf("reply_at %q is not RFC3339: %v", replyAt, parseErr)
 	}

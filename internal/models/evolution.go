@@ -7,7 +7,6 @@ import (
 
 type EvolutionInstance struct {
 	ID               string                 `json:"id"`
-	TenantID         string                 `json:"tenant_id"`
 	InstanceID       string                 `json:"instance_id"`
 	InstanceName     string                 `json:"instance_name"`
 	APIKey           *string                `json:"api_key,omitempty"`
@@ -130,7 +129,6 @@ type EvolutionWebhook struct {
 	Event        string          `json:"event"`
 	Data         json.RawMessage `json:"data"`
 	InstanceName string          `json:"-"` // preenchido pelo handler via query param
-	TenantID     string          `json:"-"` // preenchido pelo handler via query param
 }
 
 // EvolutionMessageData contém os dados de uma mensagem (usado em webhook e em send response)

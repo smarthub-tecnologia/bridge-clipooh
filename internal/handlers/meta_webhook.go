@@ -22,6 +22,11 @@ import (
 var (
 	getInstanceIDByPhoneNumberIDFn = metaconfig.GetInstanceIDByPhoneNumberID
 	lookupEventIDByPhoneFn         = metaconfig.LookupEventIDByPhone
+	// afterMetaWebhookEvent é um hook só de teste — processMetaEvent roda numa
+	// goroutine fire-and-forget (HandleEvent já respondeu 200 antes de
+	// chamá-la), então os testes precisam de um jeito de saber quando ela
+	// terminou. No-op em produção.
+	afterMetaWebhookEvent = func() {}
 )
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -91,6 +96,8 @@ func (h *MetaWebhookHandler) HandleEvent(w http.ResponseWriter, r *http.Request)
 // ── Event processing ──────────────────────────────────────────────────────────
 
 func processMetaEvent(payload metaWebhookPayload) {
+	defer afterMetaWebhookEvent()
+
 	if len(payload.Entry) == 0 || len(payload.Entry[0].Changes) == 0 {
 		return
 	}
@@ -103,7 +110,10 @@ func processMetaEvent(payload metaWebhookPayload) {
 		return
 	}
 
-	// Process delivery status updates.
+	// Log delivery status updates — não há mais callback para plataforma
+	// externa (Directus/Linkko); o bridge só faz a ponte Chatwoot ↔ providers
+	// de WhatsApp, então isso só fica registrado nos logs estruturados para
+	// debug/auditoria (correlacionar wamid ↔ event_id).
 	for _, status := range value.Statuses {
 		eventID, ok := wamidstore.Get(status.ID)
 		if !ok {
@@ -111,36 +121,30 @@ func processMetaEvent(payload metaWebhookPayload) {
 		}
 		switch status.Status {
 		case "sent":
-			sendMetaCallback(metaSentCallback{
-				Event:              "sent",
-				EventID:            eventID,
-				InstanceID:         instanceID,
-				Timestamp:          unixStringToISO8601(status.Timestamp),
-				Provider:           "meta",
-				Wamid:              status.ID,
-				PhoneNumberID:      phoneNumberID,
-				ConversationID:     status.Conversation.ID,
-				ConversationOrigin: status.Conversation.Origin.Type,
-			})
+			zap.L().Info("meta message status: sent",
+				zap.String("event_id", eventID),
+				zap.String("instance_id", instanceID),
+				zap.String("wamid", status.ID),
+				zap.String("phone_number_id", phoneNumberID),
+				zap.String("conversation_id", status.Conversation.ID),
+				zap.String("conversation_origin", status.Conversation.Origin.Type),
+				zap.String("timestamp", unixStringToISO8601(status.Timestamp)),
+			)
 		case "delivered":
-			sendMetaCallback(metaDeliveredCallback{
-				Event:         "delivered",
-				EventID:       eventID,
-				InstanceID:    instanceID,
-				Timestamp:     unixStringToISO8601(status.Timestamp),
-				Provider:      "meta",
-				Wamid:         status.ID,
-				PhoneNumberID: phoneNumberID,
-				DeliveredAt:   unixStringToISO8601(status.Timestamp),
-			})
+			zap.L().Info("meta message status: delivered",
+				zap.String("event_id", eventID),
+				zap.String("instance_id", instanceID),
+				zap.String("wamid", status.ID),
+				zap.String("phone_number_id", phoneNumberID),
+				zap.String("delivered_at", unixStringToISO8601(status.Timestamp)),
+			)
 		}
 	}
 
-	// Process inbound messages.
+	// Log inbound messages received via Meta Cloud API.
 	// event_id is resolved via wa_message_logs (most recent sent/delivered to
 	// this phone on this instance) — NOT via wamidstore, which only holds wamids
 	// of messages the Bridge sent outbound.
-	now := time.Now().UTC().Format(time.RFC3339)
 	for _, msg := range value.Messages {
 		eventID, found, err := lookupEventIDByPhoneFn(instanceID, msg.From)
 		if err != nil {
@@ -148,33 +152,25 @@ func processMetaEvent(payload metaWebhookPayload) {
 				zap.String("instance_id", instanceID),
 				zap.Error(err),
 			)
-			// Continue with event_id=null rather than dropping the callback.
-		}
-
-		var eventIDPtr *string
-		if found {
-			eventIDPtr = &eventID
+			// Continue with event_id="" rather than dropping the log entry.
 		}
 
 		textBody := ""
 		if msg.Type == "text" {
 			textBody = msg.Text.Body
 		}
-		sendMetaCallback(metaMessageReceivedCallback{
-			Event:         "message.received",
-			EventID:       eventIDPtr,
-			InstanceID:    instanceID,
-			Timestamp:     now,
-			Provider:      "meta",
-			Wamid:         msg.ID,
-			PhoneNumberID: phoneNumberID,
-			Reply: metaWebhookReply{
-				From:        msg.From,
-				Text:        textBody,
-				ReplyAt:     unixStringToISO8601(msg.Timestamp),
-				MessageType: msg.Type,
-			},
-		})
+		logger := zap.L().With(
+			zap.String("instance_id", instanceID),
+			zap.String("wamid", msg.ID),
+			zap.String("phone_number_id", phoneNumberID),
+			zap.String("from", msg.From),
+			zap.String("message_type", msg.Type),
+			zap.String("reply_at", unixStringToISO8601(msg.Timestamp)),
+		)
+		if found {
+			logger = logger.With(zap.String("event_id", eventID))
+		}
+		logger.Info("meta message received", zap.String("text", textBody))
 	}
 }
 
@@ -210,35 +206,6 @@ type metaWebhookPayload struct {
 			} `json:"value"`
 		} `json:"changes"`
 	} `json:"entry"`
-}
-
-type metaDeliveredCallback struct {
-	Event         string `json:"event"`
-	EventID       string `json:"event_id"`
-	InstanceID    string `json:"instance_id"`
-	Timestamp     string `json:"timestamp"`
-	Provider      string `json:"provider"`
-	Wamid         string `json:"wamid"`
-	PhoneNumberID string `json:"phone_number_id"`
-	DeliveredAt   string `json:"delivered_at"`
-}
-
-type metaWebhookReply struct {
-	From        string `json:"from"`
-	Text        string `json:"text"`
-	ReplyAt     string `json:"reply_at"`
-	MessageType string `json:"message_type"`
-}
-
-type metaMessageReceivedCallback struct {
-	Event         string           `json:"event"`
-	EventID       *string          `json:"event_id"`
-	InstanceID    string           `json:"instance_id"`
-	Timestamp     string           `json:"timestamp"`
-	Provider      string           `json:"provider"`
-	Wamid         string           `json:"wamid"`
-	PhoneNumberID string           `json:"phone_number_id"`
-	Reply         metaWebhookReply `json:"reply"`
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

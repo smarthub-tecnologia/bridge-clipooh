@@ -80,26 +80,6 @@ func (s *AuthService) ValidateEvolutionHMAC(r *http.Request) bool {
 	return hmac.Equal([]byte(signature), []byte(expectedMAC))
 }
 
-func (s *AuthService) ValidateChatwootToken(r *http.Request) bool {
-	secret := os.Getenv("WEBHOOK_SECRET_CHATWOOT")
-	if secret == "" {
-		return true
-	}
-	// Chatwoot pode enviar o token em diferentes headers dependendo da versão
-	candidates := []string{
-		r.Header.Get("X-Chatwoot-Token"),
-		r.Header.Get("Authorization"),
-		strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "),
-		r.URL.Query().Get("token"),
-	}
-	for _, c := range candidates {
-		if c == secret {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *AuthService) ValidateBridgeAPIKey(r *http.Request) bool {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {

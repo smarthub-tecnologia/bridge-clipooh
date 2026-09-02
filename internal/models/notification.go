@@ -12,12 +12,11 @@ type SendMessageRequest struct {
 	Instance string            `json:"instance,omitempty"` // opcional, usa default
 	Metadata map[string]string `json:"metadata,omitempty"`
 	// EventID, quando informado pelo caller, vira o id da notificação (em vez de um
-	// UUID gerado internamente) — propagado como event_id nos callbacks
-	// subsequentes (CallbackPayload.LogID), pro caller correlacionar a resposta
-	// sem precisar de uma segunda chamada a GET /notify/status/:id. Só é honrado
-	// quando To tem exatamente 1 destinatário (ver NotificationService.SendMessage)
-	// — em envios em lote um único event_id não correlacionaria unicamente.
-	// Mesmo princípio que já existia só pro provider Meta (NotifyRequest.EventID).
+	// UUID gerado internamente), pro caller correlacionar via GET /notify/status/:id
+	// sem depender do id gerado pela Bridge. Só é honrado quando To tem exatamente
+	// 1 destinatário (ver NotificationService.SendMessage) — em envios em lote um
+	// único event_id não correlacionaria unicamente. Mesmo princípio que já existia
+	// só pro provider Meta (NotifyRequest.EventID).
 	EventID string `json:"event_id,omitempty"`
 }
 

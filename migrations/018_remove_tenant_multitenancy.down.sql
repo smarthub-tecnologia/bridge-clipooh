@@ -1,0 +1,3 @@
+-- No rollback — bridge é single-tenant por decisão de produto (exclusivo da
+-- Cartão Pro). Os dados de tenants/addon_events não têm mais consumidor e
+-- não são recuperáveis após o DROP (mesmo precedente de 011_remove_plans_usage).

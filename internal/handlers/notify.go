@@ -182,7 +182,11 @@ func (h *NotifyHandler) GetQRCode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// TriggerConnect POST /api/v1/instances/{instanceName}/connect
+// TriggerConnect POST /api/v1/instances/{instanceName}/connect — endpoint
+// canônico único de reconexão de instância (reconfigura webhook + gera QR).
+// Body opcional {"token": "novo-token"} troca o token da instância antes de
+// reconectar (capacidade que antes só existia em POST /admin/tenants/{id}/connect,
+// removida junto com o conceito de tenant).
 // Triggers QR code generation by reconnecting the Evolution GO instance.
 // Polls Evolution GO GET /instance/qr directly (up to 10s) — no webhook dependency.
 // Returns { status: "ready", qr_base64: "..." } if QR is available, or { status: "connecting" }.
@@ -199,7 +203,12 @@ func (h *NotifyHandler) TriggerConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	qrBase64, err := h.adminService.ReconnectByInstanceName(r.Context(), instanceName)
+	var body struct {
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // body é opcional — ignoramos erro de decodificação
+
+	qrBase64, err := h.adminService.ReconnectByInstanceName(r.Context(), instanceName, body.Token)
 	if err != nil {
 		zap.L().Error("failed to trigger QR code generation",
 			zap.String("instance", instanceName),

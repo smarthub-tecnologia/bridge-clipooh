@@ -12,6 +12,12 @@ import (
 	"github.com/linkkotech/bridge/internal/services"
 )
 
+// AdminHandler expõe operações administrativas do bridge single-tenant da
+// Cartão Pro: provisionamento de instâncias Evolution GO e manutenção da
+// única conta Chatwoot (widget, agentes). Não há mais rotas de tenant nem de
+// rotação de secret — a conta Chatwoot é fixa (CHATWOOT_ACCOUNT_ID/API_TOKEN),
+// e CHATWOOT_WEBHOOK_SECRET é rotacionado via env var + redeploy (ver
+// comentário em internal/config/config.go).
 type AdminHandler struct {
 	adminService *services.AdminService
 	authService  *middleware.AuthService
@@ -21,28 +27,18 @@ func NewAdminHandler(adminService *services.AdminService, authService *middlewar
 	return &AdminHandler{adminService: adminService, authService: authService}
 }
 
-func (h *AdminHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
+// CreateInstance POST /api/v1/admin/instances — provisiona uma nova linha
+// WhatsApp (instância Evolution GO) na conta Cartão Pro já existente.
+func (h *AdminHandler) CreateInstance(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	logger := zap.L().With(zap.String("handler", "create_tenant"))
+	logger := zap.L().With(zap.String("handler", "create_instance"))
 
-	var req services.CreateTenantRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "INVALID_PAYLOAD", "Invalid request body", nil)
-		return
-	}
+	var req services.CreateInstanceRequest
+	_ = json.NewDecoder(r.Body).Decode(&req) // body é opcional (instance_name pode ser omitido)
 
-	if req.Name == "" {
-		respondError(w, http.StatusBadRequest, "MISSING_FIELDS", "name is required", nil)
-		return
-	}
-	if !req.EvolutionOnly && (req.AdminEmail == "" || req.AdminPassword == "") {
-		respondError(w, http.StatusBadRequest, "MISSING_FIELDS", "admin_email and admin_password are required when evolution_only is false", nil)
-		return
-	}
-
-	resp, err := h.adminService.CreateTenant(ctx, req)
+	resp, err := h.adminService.CreateInstance(ctx, req)
 	if err != nil {
-		logger.Error("failed to create tenant", zap.Error(err))
+		logger.Error("failed to create instance", zap.Error(err))
 		respondError(w, http.StatusInternalServerError, "PROVISIONING_FAILED", err.Error(), nil)
 		return
 	}
@@ -50,81 +46,19 @@ func (h *AdminHandler) CreateTenant(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusCreated, resp)
 }
 
-func (h *AdminHandler) GetTenant(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-	tenant, err := h.adminService.GetTenant(r.Context(), tenantID)
-	if err != nil {
-		respondError(w, http.StatusNotFound, "TENANT_NOT_FOUND", "Tenant not found", nil)
-		return
-	}
-	respondJSON(w, http.StatusOK, tenant)
-}
-
-func (h *AdminHandler) DeleteTenant(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-	if err := h.adminService.DeleteTenant(r.Context(), tenantID); err != nil {
-		respondError(w, http.StatusInternalServerError, "DELETE_FAILED", err.Error(), nil)
-		return
-	}
-	respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-}
-
-func (h *AdminHandler) ConnectTenant(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-
-	var body struct {
-		Token string `json:"token"`
-	}
-	// body é opcional — ignoramos erro de decodificação
-	_ = json.NewDecoder(r.Body).Decode(&body)
-
-	if err := h.adminService.ReconnectInstance(r.Context(), tenantID, body.Token); err != nil {
-		zap.L().Error("failed to reconnect instance", zap.String("tenant_id", tenantID), zap.Error(err))
-		respondError(w, http.StatusInternalServerError, "CONNECT_FAILED", err.Error(), nil)
-		return
-	}
-	respondJSON(w, http.StatusOK, map[string]string{"status": "connected"})
-}
-
-func (h *AdminHandler) SetChatwootWebhookSecret(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-
-	var body struct {
-		Secret string `json:"secret"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Secret == "" {
-		respondError(w, http.StatusBadRequest, "INVALID_BODY", "secret is required", nil)
-		return
-	}
-
-	tenant, err := h.adminService.GetTenant(r.Context(), tenantID)
-	if err != nil {
-		respondError(w, http.StatusNotFound, "NOT_FOUND", "tenant not found", nil)
-		return
-	}
-	tenant.ChatwootWebhookSecret = &body.Secret
-	if err := h.adminService.UpdateTenant(r.Context(), tenant); err != nil {
-		respondError(w, http.StatusInternalServerError, "UPDATE_FAILED", err.Error(), nil)
-		return
-	}
-	respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
-}
-
-// CreateWidgetInbox cria uma inbox tipo Website (widget público) na mesma
-// conta Chatwoot do tenant — usada pelo addon "Widget de Chat do Perfil
+// CreateWidgetInbox cria uma inbox tipo Website (widget público) na conta
+// Chatwoot da Cartão Pro — usada pelo addon "Widget de Chat do Perfil
 // Digital". Não persiste nada localmente: só fala com o Chatwoot e devolve
 // os dados pro Next.js gravar em workspace_chat_inboxes.
 func (h *AdminHandler) CreateWidgetInbox(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-
 	var body struct {
 		Name string `json:"name"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body) // name é opcional — usa default se ausente/corpo vazio
 
-	resp, err := h.adminService.CreateWidgetInbox(r.Context(), tenantID, body.Name)
+	resp, err := h.adminService.CreateWidgetInbox(r.Context(), body.Name)
 	if err != nil {
-		zap.L().Error("failed to create widget inbox", zap.String("tenant_id", tenantID), zap.Error(err))
+		zap.L().Error("failed to create widget inbox", zap.Error(err))
 		respondError(w, http.StatusInternalServerError, "WIDGET_INBOX_FAILED", err.Error(), nil)
 		return
 	}
@@ -132,28 +66,24 @@ func (h *AdminHandler) CreateWidgetInbox(w http.ResponseWriter, r *http.Request)
 }
 
 // SyncWidgetWebhook migra o webhook de conta do widget pra incluir eventos
-// novos (ex.: typing) em tenants que provisionaram o widget antes desses
-// eventos existirem em widgetWebhookSubscriptions. Não recria a inbox —
-// diferente de CreateWidgetInbox, é seguro chamar em tenants já ativos.
+// novos (ex.: typing) caso tenham sido adicionados depois do provisionamento
+// original. Não recria a inbox — seguro chamar a qualquer momento.
 func (h *AdminHandler) SyncWidgetWebhook(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-
-	resp, err := h.adminService.SyncWidgetWebhook(r.Context(), tenantID)
+	resp, err := h.adminService.SyncWidgetWebhook(r.Context())
 	if err != nil {
-		zap.L().Error("failed to sync widget webhook", zap.String("tenant_id", tenantID), zap.Error(err))
+		zap.L().Error("failed to sync widget webhook", zap.Error(err))
 		respondError(w, http.StatusInternalServerError, "WIDGET_WEBHOOK_SYNC_FAILED", err.Error(), nil)
 		return
 	}
 	respondJSON(w, http.StatusOK, resp)
 }
 
-// CreateAgent vincula um profile do workspace como agente numa conta Chatwoot
-// já provisionada — usado pelo combobox da aba "Usuários" do addon combo.
+// CreateAgent vincula um profile do workspace como agente na conta Chatwoot
+// da Cartão Pro — usado pelo combobox da aba "Usuários" do addon combo.
 // Nunca devolve senha (gerada e descartada internamente); dispara o e-mail
 // nativo de definição de senha do Chatwoot.
 func (h *AdminHandler) CreateAgent(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-	logger := zap.L().With(zap.String("handler", "create_agent"), zap.String("tenant_id", tenantID))
+	logger := zap.L().With(zap.String("handler", "create_agent"))
 
 	var req services.CreateAgentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -165,7 +95,7 @@ func (h *AdminHandler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := h.adminService.CreateAgent(r.Context(), tenantID, req)
+	resp, err := h.adminService.CreateAgent(r.Context(), req)
 	if err != nil {
 		logger.Error("failed to create agent", zap.Error(err))
 		respondError(w, http.StatusInternalServerError, "CREATE_AGENT_FAILED", err.Error(), nil)
@@ -175,11 +105,10 @@ func (h *AdminHandler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusCreated, resp)
 }
 
-// RemoveAgent desvincula um agente de uma conta Chatwoot já provisionada.
+// RemoveAgent desvincula um agente da conta Chatwoot da Cartão Pro.
 func (h *AdminHandler) RemoveAgent(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
 	agentIDStr := chi.URLParam(r, "agentId")
-	logger := zap.L().With(zap.String("handler", "remove_agent"), zap.String("tenant_id", tenantID))
+	logger := zap.L().With(zap.String("handler", "remove_agent"))
 
 	agentID, err := strconv.Atoi(agentIDStr)
 	if err != nil {
@@ -187,25 +116,13 @@ func (h *AdminHandler) RemoveAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.adminService.RemoveAgent(r.Context(), tenantID, agentID); err != nil {
+	if err := h.adminService.RemoveAgent(r.Context(), agentID); err != nil {
 		logger.Error("failed to remove agent", zap.Int("agent_id", agentID), zap.Error(err))
 		respondError(w, http.StatusInternalServerError, "REMOVE_AGENT_FAILED", err.Error(), nil)
 		return
 	}
 
 	respondJSON(w, http.StatusOK, map[string]string{"status": "removed"})
-}
-
-func (h *AdminHandler) SyncChatwootSecret(w http.ResponseWriter, r *http.Request) {
-	tenantID := chi.URLParam(r, "id")
-
-	secretLen, err := h.adminService.SyncChatwootSecret(r.Context(), tenantID)
-	if err != nil {
-		zap.L().Error("sync_chatwoot_secret failed", zap.String("tenant_id", tenantID), zap.Error(err))
-		respondError(w, http.StatusInternalServerError, "SYNC_FAILED", err.Error(), nil)
-		return
-	}
-	respondJSON(w, http.StatusOK, map[string]interface{}{"status": "synced", "secret_len": secretLen})
 }
 
 // Helpers

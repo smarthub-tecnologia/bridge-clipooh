@@ -17,40 +17,36 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/linkkotech/bridge/internal/config"
 	"github.com/linkkotech/bridge/internal/models"
 	"github.com/linkkotech/bridge/internal/observability"
 	"github.com/linkkotech/bridge/internal/repository"
-	"github.com/linkkotech/bridge/pkg/metaconfig"
 )
 
 type BridgeService struct {
-	tenantRepo          repository.TenantRepository
 	instanceRepo        repository.InstanceRepository
 	inboxRepo           *repository.InboxRepository
-	eventRepo           repository.AddonEventRepository
 	evolutionClient     *EvolutionClient
 	mediaService        *MediaService
 	cacheService        *CacheService
-	callbackService     *CallbackService
 	metrics             *observability.MetricsCollector
+	chatwoot            config.ChatwootConfig
 	reconnectInProgress sync.Map
 }
 
 func NewBridgeService(
-	tenantRepo repository.TenantRepository,
 	instanceRepo repository.InstanceRepository,
 	inboxRepo *repository.InboxRepository,
-	eventRepo repository.AddonEventRepository,
 	evolutionClient *EvolutionClient,
 	mediaService *MediaService,
+	chatwootCfg config.ChatwootConfig,
 ) *BridgeService {
 	return &BridgeService{
-		tenantRepo:      tenantRepo,
 		instanceRepo:    instanceRepo,
 		inboxRepo:       inboxRepo,
-		eventRepo:       eventRepo,
 		evolutionClient: evolutionClient,
 		mediaService:    mediaService,
+		chatwoot:        chatwootCfg,
 	}
 }
 
@@ -58,26 +54,20 @@ func (b *BridgeService) SetCacheService(cache *CacheService) {
 	b.cacheService = cache
 }
 
-func (b *BridgeService) SetCallbackService(cb *CallbackService) {
-	b.callbackService = cb
-}
-
 func (b *BridgeService) SetMetrics(m *observability.MetricsCollector) {
 	b.metrics = m
 }
 
-// ValidateChatwootWebhookSecret valida a assinatura HMAC-SHA256 do webhook Chatwoot.
-func (b *BridgeService) ValidateChatwootWebhookSecret(ctx context.Context, tenantID string, r *nethttp.Request) bool {
-	tenant, err := b.tenantRepo.FindByID(ctx, tenantID)
-	if err != nil || tenant == nil {
-		return false
-	}
+// ValidateChatwootWebhookSecret valida a assinatura HMAC-SHA256 do webhook Chatwoot
+// contra o secret único fixo da conta (CHATWOOT_WEBHOOK_SECRET) — não há mais
+// lookup por tenant, só existe uma conta Chatwoot.
+func (b *BridgeService) ValidateChatwootWebhookSecret(r *nethttp.Request) bool {
+	secret := strings.TrimSpace(b.chatwoot.WebhookSecret)
 	// Se não há segredo configurado, aceita qualquer request
-	if tenant.ChatwootWebhookSecret == nil || *tenant.ChatwootWebhookSecret == "" {
-		zap.L().Warn("chatwoot_webhook_secret not set for tenant, accepting request", zap.String("tenant_id", tenantID))
+	if secret == "" {
+		zap.L().Warn("CHATWOOT_WEBHOOK_SECRET not set, accepting request")
 		return true
 	}
-	secret := strings.TrimSpace(*tenant.ChatwootWebhookSecret)
 
 	// Log de identidade do segredo (nunca loga o segredo completo)
 	secretPreview := secret
@@ -85,7 +75,6 @@ func (b *BridgeService) ValidateChatwootWebhookSecret(ctx context.Context, tenan
 		secretPreview = secretPreview[:3] + "..." + secretPreview[len(secretPreview)-3:]
 	}
 	zap.L().Info("chatwoot HMAC: secret identity",
-		zap.String("tenant_id", tenantID),
 		zap.Int("secret_len", len(secret)),
 		zap.String("secret_preview", secretPreview),
 	)
@@ -93,7 +82,7 @@ func (b *BridgeService) ValidateChatwootWebhookSecret(ctx context.Context, tenan
 	// Chatwoot assina o body com HMAC-SHA256 e envia X-Chatwoot-Signature: sha256=<hex>
 	sigHeader := r.Header.Get("X-Chatwoot-Signature")
 	if sigHeader == "" {
-		zap.L().Warn("missing X-Chatwoot-Signature header", zap.String("tenant_id", tenantID))
+		zap.L().Warn("missing X-Chatwoot-Signature header")
 		return false
 	}
 
@@ -136,7 +125,6 @@ func (b *BridgeService) ValidateChatwootWebhookSecret(ctx context.Context, tenan
 			expPreview = expPreview[:15] + "..."
 		}
 		zap.L().Error("chatwoot HMAC mismatch",
-			zap.String("tenant_id", tenantID),
 			zap.String("received_prefix", recvPreview),
 			zap.String("expected_prefix", expPreview),
 			zap.Int("secret_len", len(secret)),
@@ -295,49 +283,16 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 		zap.String("type", info.Type),
 	)
 
-	var tenant *models.Tenant
-	var instance *models.EvolutionInstance
-	var err error
-
-	// Estratégia 1: Se temos TenantID e InstanceName da URL, busca diretamente
-	if webhook.TenantID != "" {
-		tenant, err = b.tenantRepo.FindByID(ctx, webhook.TenantID)
-		if err != nil {
-			logger.Error("tenant not found by id from URL param", zap.Error(err))
-			return fmt.Errorf("tenant %s not found: %w", webhook.TenantID, err)
-		}
-		instance, err = b.instanceRepo.FindDefaultByTenantID(ctx, webhook.TenantID)
-		if err != nil {
-			logger.Error("instance not found for tenant", zap.Error(err))
-			return fmt.Errorf("instance for tenant %s not found: %w", webhook.TenantID, err)
-		}
-	} else {
-		// Estratégia 2: Fallback via InstanceName do webhook
-		instance, err = b.instanceRepo.FindByInstanceName(ctx, webhook.InstanceName)
-		if err != nil {
-			logger.Error("instance not found by name", zap.Error(err))
-			return fmt.Errorf("instance %s not found: %w", webhook.InstanceName, err)
-		}
-		tenant, err = b.tenantRepo.FindByID(ctx, instance.TenantID)
-		if err != nil {
-			logger.Error("tenant not found", zap.Error(err))
-			return fmt.Errorf("tenant %s not found: %w", instance.TenantID, err)
-		}
+	// Resolve a instância diretamente pelo nome (?instance= na URL do webhook) —
+	// não há mais tenant para desambiguar; cada instância Evolution existe
+	// isoladamente e pertence sempre à única conta Chatwoot da Cartão Pro.
+	if _, err := b.instanceRepo.FindByInstanceName(ctx, webhook.InstanceName); err != nil {
+		logger.Error("instance not found by name", zap.Error(err))
+		return fmt.Errorf("instance %s not found: %w", webhook.InstanceName, err)
 	}
 
-	_ = instance
-
-	if tenant.ChatwootAccountID == nil || tenant.ChatwootAPIToken == nil {
-		logger.Info("skipping chatwoot forwarding for evolution-only tenant")
-		return nil
-	}
-
-	chatwootClient := NewChatwootAdminClient(
-		tenant.ChatwootInternalURL(),
-		*tenant.ChatwootAPIToken,
-	)
-
-	accountID := *tenant.ChatwootAccountID
+	chatwootClient := NewChatwootAdminClient(b.chatwoot.InternalURL, b.chatwoot.APIToken)
+	accountID := b.chatwoot.AccountID
 
 	// CORREÇÃO LID: quando o Chat é um LID (@lid), o Sender contém o JID real do contato
 	phoneRaw := info.Chat
@@ -354,7 +309,6 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 	logger.Info("processing incoming message",
 		zap.Int("account_id", accountID),
 		zap.String("phone_number", phoneNumber),
-		zap.String("chatwoot_url", tenant.ChatwootInternalURL()),
 	)
 
 	// 3. Encontra ou cria contato
@@ -372,18 +326,18 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 	logger.Info("Step 1: Contact ID resolved", zap.Int("contact_id", contact.ID))
 
 	// 4. Encontra ou cria conversa
-	inboxID, err := b.inboxRepo.GetDefaultInboxID(ctx, tenant.ID)
+	inboxID, err := b.inboxRepo.GetDefaultInboxID(ctx)
 	if err != nil {
 		// Fallback: busca o primeiro inbox no Chatwoot e salva localmente
 		logger.Warn("inbox not in local DB, fetching from Chatwoot", zap.Error(err))
-		inbox, inboxErr := chatwootClient.GetFirstInbox(ctx, accountID, *tenant.ChatwootAPIToken)
+		inbox, inboxErr := chatwootClient.GetFirstInbox(ctx, accountID, b.chatwoot.APIToken)
 		if inboxErr != nil {
 			logger.Error("failed to get inbox from chatwoot", zap.Error(inboxErr))
 			return inboxErr
 		}
 		inboxID = inbox.ID
 		// Salva para próximas requisições
-		_ = b.inboxRepo.SaveInbox(ctx, tenant.ID, accountID, inbox.ID, inbox.Name)
+		_ = b.inboxRepo.SaveInbox(ctx, accountID, inbox.ID, inbox.Name)
 		logger.Info("inbox fetched from chatwoot and cached", zap.Int("inbox_id", inboxID))
 	}
 
@@ -464,9 +418,9 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 			return fmt.Errorf("[Recovery] re-synced contact has ID=0 for phone=%s", phoneNumber)
 		}
 		// Re-fetch inbox (invalida inboxID em memória)
-		if freshInbox, inboxErr := chatwootClient.GetFirstInbox(ctx, accountID, *tenant.ChatwootAPIToken); inboxErr == nil {
+		if freshInbox, inboxErr := chatwootClient.GetFirstInbox(ctx, accountID, b.chatwoot.APIToken); inboxErr == nil {
 			inboxID = freshInbox.ID
-			_ = b.inboxRepo.SaveInbox(ctx, tenant.ID, accountID, freshInbox.ID, freshInbox.Name)
+			_ = b.inboxRepo.SaveInbox(ctx, accountID, freshInbox.ID, freshInbox.Name)
 		}
 		// Re-fetch conversa com IDs frescos
 		freshConv, recovErr := chatwootClient.FindOrCreateConversation(ctx, accountID, inboxID, freshContact.ID)
@@ -495,39 +449,6 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 		zap.Int("conversation_id", conversationID),
 	)
 
-	// Notifica o Next.js (mesmo padrão que meta_webhook.go já usa pro provider
-	// Meta) — permite correlacionar a resposta com um pedido pendente (RIE do
-	// Event Bus, consentimento LGPD, etc). Best-effort, fire-and-forget: nunca
-	// bloqueia nem falha o forward pro Chatwoot acima, que é o caminho
-	// principal já em produção.
-	//
-	// LIMITAÇÃO CONHECIDA: só dispara pra tenants com Chatwoot configurado
-	// (workspaces "evolution-only" retornam antes de chegar aqui — ver early
-	// return logo no início desta função). Reavaliar se algum dia isso importar.
-	if b.callbackService != nil && messageReq.Content != "" {
-		// wa_message_logs.recipient_phone é gravado só com dígitos (sem "+") —
-		// phoneNumber aqui está em E.164 (com "+"), preciso normalizar antes
-		// de filtrar, senão o lookup nunca bate.
-		lookupPhone := strings.TrimPrefix(phoneNumber, "+")
-		eventID, _, err := metaconfig.LookupEventIDByPhone(webhook.InstanceName, lookupPhone)
-		if err != nil {
-			logger.Warn("lookup event_id by phone failed, callback segue sem correlação", zap.Error(err))
-		}
-		go b.callbackService.Notify(context.Background(), CallbackPayload{
-			Event:        "message.received",
-			LogID:        eventID,
-			InstanceName: webhook.InstanceName,
-			Provider:     "evolution",
-			SentAt:       time.Now(),
-			Reply: &CallbackReplyDetail{
-				From:        phoneNumber,
-				Text:        messageReq.Content,
-				ReplyAt:     time.Now().UTC().Format(time.RFC3339),
-				MessageType: "text",
-			},
-		})
-	}
-
 	return nil
 }
 
@@ -551,25 +472,17 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 		return nil
 	}
 
-	workspaceID, instanceID, err := b.instanceRepo.GetWorkspaceAndID(ctx, webhook.InstanceName)
-	if err != nil {
-		logger.Warn("instance not found for connection.update", zap.Error(err))
-		return nil
-	}
-
 	// Evento "Connected" da Evolution GO: { jid, pushName, status: "open" }
 	// O jid vem no formato "5511999998888:98@s.whatsapp.net"
 	if payload.Jid != "" && payload.Status == "open" {
-		jidClean := strings.SplitN(payload.Jid, "@", 2)[0]         // remove @s.whatsapp.net
-		jidClean = strings.SplitN(jidClean, ":", 2)[0]             // remove sufixo :XX do device
+		jidClean := strings.SplitN(payload.Jid, "@", 2)[0] // remove @s.whatsapp.net
+		jidClean = strings.SplitN(jidClean, ":", 2)[0]     // remove sufixo :XX do device
 		phone := "+" + jidClean
 
 		logger.Info("Connected event received", zap.String("phone", phone), zap.String("push_name", payload.PushName))
 
-		if err = b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "open", &phone); err != nil {
-			logger.Error("Connected: failed to update connection state, callback will NOT be sent",
-				zap.String("instance", webhook.InstanceName),
-				zap.Error(err))
+		if err := b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "open", &phone); err != nil {
+			logger.Error("Connected: failed to update connection state", zap.String("instance", webhook.InstanceName), zap.Error(err))
 			return nil
 		}
 
@@ -578,33 +491,6 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 			b.cacheService.ClearInstanceRateLimits(ctx, webhook.InstanceName)
 		}
 
-		b.eventRepo.InsertEvent(ctx, workspaceID, instanceID, "evolution", "connected", "webhook_bridge", map[string]interface{}{
-			"reason":    "connected",
-			"phone":     phone,
-			"push_name": payload.PushName,
-		})
-
-		logger.Info("Connected: sending callback to platform",
-			zap.String("instance", webhook.InstanceName),
-			zap.String("workspace_id", workspaceID))
-
-		if b.callbackService != nil {
-			// [DIAGNÓSTICO] chamada síncrona para capturar erro no log
-			if err := b.callbackService.Notify(ctx, CallbackPayload{
-				EventType:    "connection.open",
-				TenantID:     webhook.TenantID,
-				WorkspaceID:  workspaceID,
-				InstanceName: webhook.InstanceName,
-				PhoneNumber:  phone,
-				Status:       "connected",
-				Reason:       "connected",
-				SentAt:       time.Now(),
-			}); err != nil {
-				logger.Error("callback notify error", zap.Error(err))
-			} else {
-				logger.Info("callback notify ok")
-			}
-		}
 		return nil
 	}
 
@@ -612,7 +498,7 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 	if payload.State == "open" && payload.Wuid != "" {
 		phone := "+" + strings.Replace(payload.Wuid, "@s.whatsapp.net", "", 1)
 
-		if err = b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "open", &phone); err != nil {
+		if err := b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "open", &phone); err != nil {
 			logger.Error("failed to update instance state to open (wuid fallback)", zap.Error(err))
 			return nil
 		}
@@ -620,24 +506,6 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 		if b.cacheService != nil {
 			b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 			b.cacheService.ClearInstanceRateLimits(ctx, webhook.InstanceName)
-		}
-
-		b.eventRepo.InsertEvent(ctx, workspaceID, instanceID, "evolution", "connected", "webhook_bridge", map[string]interface{}{
-			"reason": "connected",
-			"phone":  phone,
-		})
-
-		if b.callbackService != nil {
-			go b.callbackService.Notify(context.Background(), CallbackPayload{
-				EventType:    "connection.open",
-				TenantID:     webhook.TenantID,
-				WorkspaceID:  workspaceID,
-				InstanceName: webhook.InstanceName,
-				PhoneNumber:  phone,
-				Status:       "connected",
-				Reason:       "connected",
-				SentAt:       time.Now(),
-			})
 		}
 	} else {
 		logger.Warn("handleConnectionUpdate: payload sem jid nem wuid reconhecível, ignorando",
@@ -675,8 +543,6 @@ func (b *BridgeService) handleQRCodeUpdated(ctx context.Context, webhook models.
 }
 
 func (b *BridgeService) handleQRTimeout(ctx context.Context, webhook models.EvolutionWebhook, logger *zap.Logger) error {
-	workspaceID, _, _ := b.instanceRepo.GetWorkspaceAndID(ctx, webhook.InstanceName)
-
 	err := b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "close", nil)
 	if err != nil {
 		logger.Warn("failed to update instance state to disconnected for qr timeout", zap.Error(err))
@@ -684,18 +550,6 @@ func (b *BridgeService) handleQRTimeout(ctx context.Context, webhook models.Evol
 
 	if b.cacheService != nil {
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
-	}
-
-	if b.callbackService != nil {
-		go b.callbackService.Notify(context.Background(), CallbackPayload{
-			EventType:    "connection.close",
-			TenantID:     webhook.TenantID,
-			WorkspaceID:  workspaceID,
-			InstanceName: webhook.InstanceName,
-			Status:       "disconnected",
-			Reason:       "qrcode_timeout",
-			SentAt:       time.Now(),
-		})
 	}
 
 	var qrData struct {
@@ -719,12 +573,11 @@ func (b *BridgeService) handleQRTimeout(ctx context.Context, webhook models.Evol
 			} else {
 				instanceToken := *instance.APIKey
 				instanceName := webhook.InstanceName
-				tenantID := webhook.TenantID
 				go func() {
 					defer b.reconnectInProgress.Delete(instanceName)
 					time.Sleep(2 * time.Second)
-					webhookURL := fmt.Sprintf("%s/webhook/evolution?instance=%s&tenant=%s",
-						os.ExpandEnv("${WEBHOOK_BASE_URL}"), instanceName, tenantID)
+					webhookURL := fmt.Sprintf("%s/webhook/evolution?instance=%s",
+						os.ExpandEnv("${WEBHOOK_BASE_URL}"), instanceName)
 					if secret := os.Getenv("WEBHOOK_SECRET_EVOLUTION"); secret != "" {
 						webhookURL += "&token=" + secret
 					}
@@ -748,19 +601,7 @@ func (b *BridgeService) handleQRTimeout(ctx context.Context, webhook models.Evol
 }
 
 func (b *BridgeService) handleLogout(ctx context.Context, webhook models.EvolutionWebhook, logger *zap.Logger) error {
-	var payload struct {
-		Reason string `json:"reason"`
-	}
-	json.Unmarshal(webhook.Data, &payload)
-
-	workspaceID, instanceID, err := b.instanceRepo.GetWorkspaceAndID(ctx, webhook.InstanceName)
-	if err != nil {
-		logger.Warn("instance not found for logout", zap.Error(err))
-		return nil
-	}
-
-	err = b.instanceRepo.LogoutInstance(ctx, webhook.InstanceName)
-	if err != nil {
+	if err := b.instanceRepo.LogoutInstance(ctx, webhook.InstanceName); err != nil {
 		logger.Error("failed to logout instance in db", zap.Error(err))
 		return nil
 	}
@@ -769,34 +610,11 @@ func (b *BridgeService) handleLogout(ctx context.Context, webhook models.Evoluti
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 	}
 
-	b.eventRepo.InsertEvent(ctx, workspaceID, instanceID, "evolution", "disconnected", "webhook_bridge", map[string]interface{}{
-		"reason": "logout",
-	})
-
-	if b.callbackService != nil {
-		go b.callbackService.Notify(context.Background(), CallbackPayload{
-			EventType:    "connection.close",
-			TenantID:     webhook.TenantID,
-			WorkspaceID:  workspaceID,
-			InstanceName: webhook.InstanceName,
-			Status:       "disconnected",
-			Reason:       "logout",
-			SentAt:       time.Now(),
-		})
-	}
-
 	return nil
 }
 
 func (b *BridgeService) handleInstanceDeleted(ctx context.Context, webhook models.EvolutionWebhook, logger *zap.Logger) error {
-	workspaceID, instanceID, err := b.instanceRepo.GetWorkspaceAndID(ctx, webhook.InstanceName)
-	if err != nil {
-		logger.Warn("instance not found for deleted event", zap.Error(err))
-		return nil
-	}
-
-	err = b.instanceRepo.DeleteInstance(ctx, webhook.InstanceName)
-	if err != nil {
+	if err := b.instanceRepo.DeleteInstance(ctx, webhook.InstanceName); err != nil {
 		logger.Error("failed to mark instance as deleted", zap.Error(err))
 		return nil
 	}
@@ -804,22 +622,6 @@ func (b *BridgeService) handleInstanceDeleted(ctx context.Context, webhook model
 	if b.cacheService != nil {
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 		b.cacheService.ClearInstanceRateLimits(ctx, webhook.InstanceName)
-	}
-
-	b.eventRepo.InsertEvent(ctx, workspaceID, instanceID, "evolution", "deleted", "webhook_bridge", map[string]interface{}{
-		"reason": "instance_deleted_on_evolution",
-	})
-
-	if b.callbackService != nil {
-		go b.callbackService.Notify(context.Background(), CallbackPayload{
-			EventType:    "instance.deleted",
-			TenantID:     webhook.TenantID,
-			WorkspaceID:  workspaceID,
-			InstanceName: webhook.InstanceName,
-			Status:       "deleted",
-			Reason:       "instance_deleted",
-			SentAt:       time.Now(),
-		})
 	}
 
 	return nil
@@ -877,19 +679,19 @@ func (b *BridgeService) handleOutgoingMessage(ctx context.Context, webhook model
 		zap.Int("attachment_count", len(webhook.Attachments)),
 	)
 
-	// 1. Encontra tenant pelo account_id
-	tenant, err := b.tenantRepo.FindByChatwootAccountID(ctx, webhook.Account.ID)
-	if err != nil {
-		logger.Error("tenant not found for Chatwoot Account",
-			zap.Int("account_id", webhook.Account.ID),
-			zap.Error(err),
+	// 1. Sanidade: confirma que o webhook é da única conta Chatwoot configurada.
+	// Um account_id divergente indica configuração incorreta (webhook apontando
+	// para o bridge errado, ou CHATWOOT_ACCOUNT_ID desatualizado).
+	if webhook.Account.ID != b.chatwoot.AccountID {
+		logger.Error("chatwoot webhook account_id does not match configured CHATWOOT_ACCOUNT_ID",
+			zap.Int("payload_account_id", webhook.Account.ID),
+			zap.Int("configured_account_id", b.chatwoot.AccountID),
 		)
 		if b.metrics != nil {
 			b.metrics.Error404Count.Add(1)
 		}
-		return err
+		return fmt.Errorf("unexpected chatwoot account_id: %d", webhook.Account.ID)
 	}
-	logger.Info("Tenant resolved", zap.String("tenant_id", tenant.ID))
 
 	// 2. Extrai phone_number direto do payload (conversation.meta.sender.phone_number)
 	// Evolution GO espera número sem "+": "5522988010114", não "+5522988010114"
@@ -903,26 +705,35 @@ func (b *BridgeService) handleOutgoingMessage(ctx context.Context, webhook model
 	}
 	logger.Info("Phone number extracted from conversation.meta.sender", zap.String("phone_number", phoneNumber))
 
-	// 3. Extrai evolution_instance de conversation.custom_attributes
+	// 3. Resolve a instância Evolution a partir de conversation.custom_attributes
+	// (gravado no inbound — ver handleIncomingMessage), com fallback pra
+	// instância default. O token usado no envio é sempre o da MESMA instância
+	// resolvida aqui — antes desta reescrita, o token vinha de uma segunda
+	// lookup separada por "instância default do tenant", o que quebraria (envio
+	// com token errado) para qualquer conversa presa a uma instância não-default
+	// agora que múltiplas instâncias reais coexistem.
 	instanceName, _ := webhook.Conversation.CustomAttributes["evolution_instance"].(string)
-	if instanceName == "" {
-		// fallback para instância padrão do tenant
-		instance, err := b.instanceRepo.FindDefaultByTenantID(ctx, tenant.ID)
+	var instance *models.EvolutionInstance
+	var err error
+	if instanceName != "" {
+		instance, err = b.instanceRepo.FindByInstanceName(ctx, instanceName)
 		if err != nil {
-			return fmt.Errorf("no evolution instance for tenant: %w", err)
+			logger.Warn("evolution_instance from custom_attributes not found, falling back to default",
+				zap.String("instance_name", instanceName), zap.Error(err))
+			instance = nil
+		} else {
+			logger.Info("Evolution instance resolved from conversation.custom_attributes", zap.String("instance_name", instanceName))
+		}
+	}
+	if instance == nil {
+		instance, err = b.instanceRepo.FindDefault(ctx)
+		if err != nil {
+			return fmt.Errorf("no evolution instance available: %w", err)
 		}
 		instanceName = instance.InstanceName
 		logger.Info("Evolution instance resolved via fallback", zap.String("instance_name", instanceName))
-	} else {
-		logger.Info("Evolution instance resolved from conversation.custom_attributes", zap.String("instance_name", instanceName))
 	}
 
-	// 3. Obtém token da instância para autenticação no envio
-	instance, err := b.instanceRepo.FindDefaultByTenantID(ctx, tenant.ID)
-	if err != nil {
-		logger.Error("failed to find evolution instance for tenant", zap.Error(err))
-		return err
-	}
 	instanceToken := ""
 	if instance.APIKey != nil {
 		instanceToken = *instance.APIKey

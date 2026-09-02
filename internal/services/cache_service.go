@@ -2,10 +2,8 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
-	"github.com/linkkotech/bridge/internal/models"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -16,23 +14,6 @@ type CacheService struct {
 
 func NewCacheService(redis *redis.Client) *CacheService {
 	return &CacheService{redis: redis, ttl: 5 * time.Minute}
-}
-
-func (c *CacheService) GetTenant(ctx context.Context, id string) (*models.Tenant, error) {
-	val, err := c.redis.Get(ctx, "tenant:"+id).Result()
-	if err != nil {
-		return nil, err
-	}
-	var tenant models.Tenant
-	if err := json.Unmarshal([]byte(val), &tenant); err != nil {
-		return nil, err
-	}
-	return &tenant, nil
-}
-
-func (c *CacheService) SetTenant(ctx context.Context, tenant *models.Tenant) {
-	data, _ := json.Marshal(tenant)
-	c.redis.Set(ctx, "tenant:"+tenant.ID, data, c.ttl)
 }
 
 // IsProcessed returns true if this message_id was already handled (TTL = 24h).
