@@ -1,0 +1,1 @@
+ALTER TABLE evolution_instances DROP CONSTRAINT uq_evolution_instances_instance_name;
