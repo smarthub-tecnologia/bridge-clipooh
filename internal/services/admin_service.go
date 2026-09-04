@@ -714,10 +714,15 @@ func (s *AdminService) checkAllWebhooks(ctx context.Context) {
 			zap.String("instance", full.InstanceName),
 			zap.String("instance_id", full.InstanceID),
 		)
-		if err := s.reconfigureWebhook(ctx, full.InstanceName, ""); err != nil {
+		// Lock exclusivo por instância: evita configurar webhook/ConnectInstance
+		// enquanto um /connect ou o auto-reconnect de QRTimeout está em andamento.
+		unlock := lockInstanceConnect(full.InstanceName)
+		reconnectErr := s.reconfigureWebhook(ctx, full.InstanceName, "")
+		unlock()
+		if reconnectErr != nil {
 			logger.Error("health check: reconnect failed",
 				zap.String("instance", full.InstanceName),
-				zap.Error(err),
+				zap.Error(reconnectErr),
 			)
 		} else {
 			logger.Info("health check: webhook restored",
@@ -785,6 +790,13 @@ func (s *AdminService) reconfigureWebhook(ctx context.Context, instanceName stri
 // de um novo QR Code, tentando devolvê-lo inline (até 15s de polling).
 func (s *AdminService) ReconnectByInstanceName(ctx context.Context, instanceName string, tokenOverride string) (qrBase64 string, err error) {
 	logger := zap.L().With(zap.String("instance_name", instanceName))
+
+	// Lock exclusivo da instância durante TODO o fluxo de /connect (configuração
+	// de webhook + geração de QR + polling). Garante que o auto-reconnect interno
+	// do bridge (QRTimeout) não chame ConnectInstance para a mesma instância
+	// enquanto este fluxo estiver em andamento.
+	unlock := lockInstanceConnect(instanceName)
+	defer unlock()
 
 	if err := s.reconfigureWebhook(ctx, instanceName, tokenOverride); err != nil {
 		return "", err
@@ -857,6 +869,13 @@ func (s *AdminService) ReconnectByInstanceName(ctx context.Context, instanceName
 // o webhook — a geração do QR é tratada pelo fluxo TriggerConnect separadamente.
 func (s *AdminService) RecreateInstance(ctx context.Context, instanceName string) error {
 	logger := zap.L().With(zap.String("instance", instanceName))
+
+	// Lock exclusivo por instância durante todo o recreate (delete + create +
+	// ConnectInstance): evita concorrer com /connect ou auto-reconnect do bridge.
+	unlock := lockInstanceConnect(instanceName)
+	defer unlock()
+	// Invalida ciclos de QR pendentes do ciclo antigo desta instância.
+	bumpInstanceQREpoch(instanceName)
 
 	instance, err := s.instanceRepo.FindByInstanceName(ctx, instanceName)
 	if err != nil {
@@ -943,6 +962,10 @@ func (s *AdminService) ForceLogoutInstance(ctx context.Context, instanceName str
 		logger.Error("failed to update instance state to disconnected after logout", zap.Error(err))
 		return err
 	}
+
+	// Logout explícito concluído: invalida ciclos de QR pendentes (auto-reconnects
+	// adormecidos do bridge não devem reconectar logo após um /logout do painel).
+	bumpInstanceQREpoch(instanceName)
 
 	logger.Info("instance force-logged out successfully")
 	return nil

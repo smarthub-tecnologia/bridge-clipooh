@@ -58,6 +58,25 @@ func (b *BridgeService) SetMetrics(m *observability.MetricsCollector) {
 	b.metrics = m
 }
 
+// isInstanceConnected indica sessão ativa de verdade: status "connected" E
+// telefone preenchido no banco. Só o status não basta — um QRTimeout tardio não
+// pode tratar a instância como conectada se não houver telefone registrado.
+func (b *BridgeService) isInstanceConnected(instance *models.EvolutionInstance) bool {
+	return instance != nil &&
+		instance.Status == "connected" &&
+		instance.PhoneNumber != nil &&
+		*instance.PhoneNumber != ""
+}
+
+// invalidatePendingQRCycle cancela ciclos de QR pendentes da instância:
+// remove o marcador de auto-reconnect e bufa a "era" do ciclo. Usado quando um
+// Connected/PairSuccess (ou logout/disconnect) é processado com sucesso, para
+// que um QRTimeout tardio ou um auto-reconnect adormecido não derrube a sessão.
+func (b *BridgeService) invalidatePendingQRCycle(instanceName string) {
+	b.reconnectInProgress.Delete(instanceName)
+	bumpInstanceQREpoch(instanceName)
+}
+
 // ValidateChatwootWebhookSecret valida a assinatura HMAC-SHA256 do webhook Chatwoot
 // contra o secret único fixo da conta (CHATWOOT_WEBHOOK_SECRET) — não há mais
 // lookup por tenant, só existe uma conta Chatwoot.
@@ -498,6 +517,12 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 			return nil
 		}
 
+		// Connected com sucesso: invalida qualquer ciclo de QR/auto-reconnect
+		// pendente para esta instância (ex.: goroutine de QRTimeout adormecida).
+		b.invalidatePendingQRCycle(webhook.InstanceName)
+		logger.Info("Connected: pending QR/reconnect cycle invalidated",
+			zap.String("instance", webhook.InstanceName))
+
 		if b.cacheService != nil {
 			b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 			b.cacheService.ClearInstanceRateLimits(ctx, webhook.InstanceName)
@@ -521,6 +546,9 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 			logger.Error("failed to update instance state to open (wuid fallback)", zap.Error(err))
 			return nil
 		}
+
+		// Connected com sucesso (fallback wuid): invalida ciclo de QR pendente.
+		b.invalidatePendingQRCycle(webhook.InstanceName)
 
 		if b.cacheService != nil {
 			b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
@@ -569,8 +597,41 @@ func (b *BridgeService) handleQRCodeUpdated(ctx context.Context, webhook models.
 }
 
 func (b *BridgeService) handleQRTimeout(ctx context.Context, webhook models.EvolutionWebhook, logger *zap.Logger) error {
-	err := b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "close", nil)
+	var qrData struct {
+		QRCount     int  `json:"qrcount"`
+		MaxCount    int  `json:"maxCount"`
+		ForceLogout bool `json:"forceLogout"`
+	}
+	_ = json.Unmarshal(webhook.Data, &qrData)
+
+	// ===== GUARDA ANTI-RACE (QRTimeout tardio vs Connected/PairSuccess) =====
+	// O QRTimeout pode ser de um ciclo de QR antigo que ainda estava em andamento
+	// quando a sessão conectou. Consultamos o estado ANTES de qualquer mudança no
+	// banco: marcar "disconnected" primeiro faria o check abaixo nunca enxergar o
+	// connected, e o auto-reconnect derrubaria a sessão recém-conectada.
+	current, err := b.instanceRepo.FindByInstanceName(ctx, webhook.InstanceName)
 	if err != nil {
+		logger.Warn("QRTimeout: could not fetch instance — skipping state change and auto-reconnect",
+			zap.String("instance", webhook.InstanceName),
+			zap.Error(err),
+		)
+		return nil
+	}
+
+	if b.isInstanceConnected(current) {
+		logger.Info("QRTimeout ignored: instance already connected (stale QR cycle) — auto-reconnect aborted, no QR generated, no state change",
+			zap.String("instance", webhook.InstanceName),
+			zap.String("status", current.Status),
+		)
+		// Limpa QR cache obsoleto, mas NÃO altera o estado no banco.
+		if b.cacheService != nil {
+			b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
+		}
+		return nil
+	}
+
+	// Instância de fato não está conectada — segue o fluxo original de QR timeout.
+	if err := b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "close", nil); err != nil {
 		logger.Warn("failed to update instance state to disconnected for qr timeout", zap.Error(err))
 	}
 
@@ -578,20 +639,12 @@ func (b *BridgeService) handleQRTimeout(ctx context.Context, webhook models.Evol
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 	}
 
-	var qrData struct {
-		QRCount     int  `json:"qrcount"`
-		MaxCount    int  `json:"maxCount"`
-		ForceLogout bool `json:"forceLogout"`
-	}
-	json.Unmarshal(webhook.Data, &qrData)
-
 	if qrData.QRCount >= qrData.MaxCount || qrData.ForceLogout {
-		instance, err := b.instanceRepo.FindByInstanceName(ctx, webhook.InstanceName)
-		if err != nil || instance == nil || instance.APIKey == nil {
-			logger.Warn("QR limit reached: could not fetch instance token for auto-reconnect", zap.Error(err))
-		} else if instance.Status == "connected" {
-			logger.Info("QR limit reached but instance already connected, skipping reconnect",
-				zap.String("instance", webhook.InstanceName))
+		// Busca o token para o auto-reconnect. Reaproveita `current` já consultado
+		// acima (o status mudou para disconnected, mas o token/APIKey é o mesmo).
+		instance := current
+		if instance == nil || instance.APIKey == nil {
+			logger.Warn("QR limit reached: could not fetch instance token for auto-reconnect")
 		} else {
 			if _, loaded := b.reconnectInProgress.LoadOrStore(webhook.InstanceName, true); loaded {
 				logger.Info("QR limit reached: reconnect already in progress, skipping",
@@ -601,7 +654,35 @@ func (b *BridgeService) handleQRTimeout(ctx context.Context, webhook models.Evol
 				instanceName := webhook.InstanceName
 				go func() {
 					defer b.reconnectInProgress.Delete(instanceName)
+
+					// Captura a era ANTES de adquirir o lock: se um Connected/logout
+					// acontecer enquanto este goroutine espera, a era muda e o
+					// auto-reconnect aborta.
+					epochAtStart := instanceQREpoch(instanceName)
+					unlock := lockInstanceConnect(instanceName)
+					defer unlock()
+
 					time.Sleep(2 * time.Second)
+
+					// Revalida antes de conectar — a sessão pode ter conectado
+					// enquanto o auto-reconnect dormia/esperava o lock.
+					latest, lerr := b.instanceRepo.FindByInstanceName(context.Background(), instanceName)
+					if lerr == nil && b.isInstanceConnected(latest) {
+						logger.Info("auto-reconnect aborted: instance connected while waiting — no new QR",
+							zap.String("instance", instanceName))
+						return
+					}
+					if lerr == nil && latest.Status == "connecting" {
+						logger.Info("auto-reconnect aborted: a new QR cycle is already in progress (connecting) — no new QR",
+							zap.String("instance", instanceName))
+						return
+					}
+					if epochAtStart != instanceQREpoch(instanceName) {
+						logger.Info("auto-reconnect aborted: connection state changed while waiting — no new QR",
+							zap.String("instance", instanceName))
+						return
+					}
+
 					webhookURL := fmt.Sprintf("%s/webhook/evolution?instance=%s",
 						os.ExpandEnv("${WEBHOOK_BASE_URL}"), instanceName)
 					if secret := os.Getenv("WEBHOOK_SECRET_EVOLUTION"); secret != "" {
@@ -632,6 +713,10 @@ func (b *BridgeService) handleLogout(ctx context.Context, webhook models.Evoluti
 		return nil
 	}
 
+	// Logout processado: invalida ciclos de QR pendentes (auto-reconnects
+	// adormecidos não devem reconectar logo após um logout explícito).
+	b.invalidatePendingQRCycle(webhook.InstanceName)
+
 	if b.cacheService != nil {
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 	}
@@ -649,6 +734,9 @@ func (b *BridgeService) handleInstanceDeleted(ctx context.Context, webhook model
 		logger.Error("failed to mark instance as deleted", zap.Error(err))
 		return nil
 	}
+
+	// Instância deletada: invalida qualquer ciclo de QR/auto-reconnect pendente.
+	b.invalidatePendingQRCycle(webhook.InstanceName)
 
 	if b.cacheService != nil {
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
@@ -715,6 +803,9 @@ func (b *BridgeService) handleDisconnected(ctx context.Context, webhook models.E
 	if err := b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "close", nil); err != nil {
 		logger.Warn("Disconnected: failed to update instance state", zap.Error(err))
 	}
+
+	// Disconnect processado: invalida ciclos de QR pendentes desta instância.
+	b.invalidatePendingQRCycle(webhook.InstanceName)
 
 	if b.cacheService != nil {
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
