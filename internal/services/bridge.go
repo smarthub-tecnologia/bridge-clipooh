@@ -160,6 +160,10 @@ func (b *BridgeService) HandleEvolutionWebhook(ctx context.Context, webhook mode
 	case "LoggedOut":
 		return b.handleLogout(ctx, webhook, logger)
 
+	// CONNECTION: o WebSocket do WhatsApp caiu sem logout explicito — Evolution GO envia "Disconnected"
+	case "Disconnected":
+		return b.handleDisconnected(ctx, webhook, logger)
+
 	// INSTANCE: deleção
 	case "DeleteInstance", "RemoveInstance":
 		return b.handleInstanceDeleted(ctx, webhook, logger)
@@ -491,6 +495,13 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 			b.cacheService.ClearInstanceRateLimits(ctx, webhook.InstanceName)
 		}
 
+		b.notifyConnectionEvent(logger, "connected", map[string]interface{}{
+			"instance":  webhook.InstanceName,
+			"phone":     phone,
+			"push_name": payload.PushName,
+			"jid":       payload.Jid,
+		})
+
 		return nil
 	}
 
@@ -507,6 +518,13 @@ func (b *BridgeService) handleConnectionUpdate(ctx context.Context, webhook mode
 			b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 			b.cacheService.ClearInstanceRateLimits(ctx, webhook.InstanceName)
 		}
+		b.notifyConnectionEvent(logger, "connected", map[string]interface{}{
+			"instance":  webhook.InstanceName,
+			"phone":     phone,
+			"push_name": payload.PushName,
+			"wuid":      payload.Wuid,
+		})
+
 	} else {
 		logger.Warn("handleConnectionUpdate: payload sem jid nem wuid reconhecível, ignorando",
 			zap.String("state", payload.State),
@@ -610,6 +628,11 @@ func (b *BridgeService) handleLogout(ctx context.Context, webhook models.Evoluti
 		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
 	}
 
+	b.notifyConnectionEvent(logger, "logged_out", map[string]interface{}{
+		"instance": webhook.InstanceName,
+		"reason":   "logout",
+	})
+
 	return nil
 }
 
@@ -624,6 +647,75 @@ func (b *BridgeService) handleInstanceDeleted(ctx context.Context, webhook model
 		b.cacheService.ClearInstanceRateLimits(ctx, webhook.InstanceName)
 	}
 
+	return nil
+}
+
+// notifyConnectionEvent dispara um webhook de saída (outbound) para
+// CONNECTION_WEBHOOK_URL sempre que o estado de conexão de uma instância muda
+// (connected/disconnected/logged_out). Permite a um consumidor externo (ex.:
+// workflow n8n) saber na hora que o WhatsApp conectou e, por exemplo, parar de
+// gerar QR codes. Fire-and-forget: roda em goroutine com timeout de 5s e nunca
+// bloqueia o processamento do webhook recebido da Evolution.
+// Opcional: CONNECTION_WEBHOOK_TOKEN é enviado no header X-Access-Token.
+func (b *BridgeService) notifyConnectionEvent(logger *zap.Logger, event string, payload map[string]interface{}) {
+	url := strings.TrimSpace(os.Getenv("CONNECTION_WEBHOOK_URL"))
+	if url == "" {
+		logger.Debug("connection webhook not configured (CONNECTION_WEBHOOK_URL), skipping outbound event",
+			zap.String("event", event))
+		return
+	}
+	token := strings.TrimSpace(os.Getenv("CONNECTION_WEBHOOK_TOKEN"))
+	payload["event"] = event
+	payload["ts"] = time.Now().Unix()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		logger.Warn("connection webhook: failed to marshal payload", zap.String("event", event), zap.Error(err))
+		return
+	}
+
+	go func() {
+		req, err := nethttp.NewRequest(nethttp.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			logger.Warn("connection webhook: failed to create request", zap.String("event", event), zap.String("url", url), zap.Error(err))
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("X-Access-Token", token)
+		}
+		client := &nethttp.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Warn("connection webhook: delivery failed", zap.String("event", event), zap.String("url", url), zap.Error(err))
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode >= 300 {
+			logger.Warn("connection webhook: non-2xx response", zap.String("event", event), zap.Int("status", resp.StatusCode))
+			return
+		}
+		logger.Info("connection webhook delivered", zap.String("event", event), zap.Int("status", resp.StatusCode))
+	}()
+}
+
+// handleDisconnected processa o evento "Disconnected" da Evolution GO: o stream
+// do WhatsApp caiu (WebSocket fechado), mas a sessão ainda está pareada. Marca a
+// instância como disconnected no banco e notifica via outbound webhook.
+func (b *BridgeService) handleDisconnected(ctx context.Context, webhook models.EvolutionWebhook, logger *zap.Logger) error {
+	if err := b.instanceRepo.UpdateConnectionState(ctx, webhook.InstanceName, "close", nil); err != nil {
+		logger.Warn("Disconnected: failed to update instance state", zap.Error(err))
+	}
+
+	if b.cacheService != nil {
+		b.cacheService.DeleteQRCode(ctx, webhook.InstanceName)
+	}
+
+	b.notifyConnectionEvent(logger, "disconnected", map[string]interface{}{
+		"instance": webhook.InstanceName,
+		"reason":   "stream_disconnected",
+	})
 	return nil
 }
 
