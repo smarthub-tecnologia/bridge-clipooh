@@ -76,6 +76,12 @@ type ChatwootCreateInboxResponse struct {
 	ID     int    `json:"id"`
 	Name   string `json:"name"`
 	Secret string `json:"secret,omitempty"` // Chatwoot auto-gera via has_secure_token; retornado apenas para admins
+	// ChannelType é o tipo real do canal no Chatwoot ("Channel::Api",
+	// "Channel::Whatsapp", "Channel::WebWidget"...). Vem no GET /inboxes e é o
+	// que permite o bridge distinguir a inbox "api" (a dele) de uma inbox
+	// WhatsApp/Meta — o rótulo inbox_type gravado localmente nem sempre
+	// corresponde ao tipo real do Chatwoot.
+	ChannelType string `json:"channel_type,omitempty"`
 }
 
 // ChatwootChannelWebWidget payload do canal "Website" (widget público) — ao

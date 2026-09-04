@@ -404,8 +404,8 @@ func (c *ChatwootAdminClient) UpdateAccountWebhook(ctx context.Context, accountI
 	return nil
 }
 
-// GetFirstInbox retorna o primeiro inbox da conta no Chatwoot
-func (c *ChatwootAdminClient) GetFirstInbox(ctx context.Context, accountID int, accountToken string) (*models.ChatwootCreateInboxResponse, error) {
+// listInboxes busca a lista de inboxes da conta no Chatwoot.
+func (c *ChatwootAdminClient) listInboxes(ctx context.Context, accountID int, accountToken string) ([]models.ChatwootCreateInboxResponse, error) {
 	url := fmt.Sprintf("%s/api/v1/accounts/%d/inboxes", c.baseURL, accountID)
 	httpReq, err := retryablehttp.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -427,10 +427,55 @@ func (c *ChatwootAdminClient) GetFirstInbox(ctx context.Context, accountID int, 
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-	if len(result.Payload) == 0 {
+	return result.Payload, nil
+}
+
+// GetAPIInbox retorna a primeira inbox do tipo Channel::Api da conta. É a inbox
+// do bridge (o combo WhatsApp via Evolution): inboxes Channel::Whatsapp
+// (ex.: Meta Cloud API) têm validação própria de source_id no Chatwoot e não
+// podem ser usadas como destino da API genérica de conversas.
+func (c *ChatwootAdminClient) GetAPIInbox(ctx context.Context, accountID int, accountToken string) (*models.ChatwootCreateInboxResponse, error) {
+	inboxes, err := c.listInboxes(ctx, accountID, accountToken)
+	if err != nil {
+		return nil, err
+	}
+	for i := range inboxes {
+		if inboxes[i].ChannelType == "Channel::Api" {
+			zap.L().Info("chatwoot api inbox resolved",
+				zap.Int("account_id", accountID),
+				zap.Int("inbox_id", inboxes[i].ID),
+				zap.String("inbox_name", inboxes[i].Name),
+			)
+			return &inboxes[i], nil
+		}
+	}
+	return nil, fmt.Errorf("no Channel::Api inbox found for account %d (channel types: %s)", accountID, inboxChannelTypes(inboxes))
+}
+
+func inboxChannelTypes(inboxes []models.ChatwootCreateInboxResponse) string {
+	types := make([]string, 0, len(inboxes))
+	for _, inb := range inboxes {
+		t := inb.ChannelType
+		if t == "" {
+			t = "?"
+		}
+		types = append(types, fmt.Sprintf("%d:%s", inb.ID, t))
+	}
+	return strings.Join(types, ", ")
+}
+
+// GetFirstInbox retorna o primeiro inbox da conta no Chatwoot. Mantido por
+// compatibilidade, mas fluxos novos devem usar GetAPIInbox — o primeiro inbox
+// pode ser de outro canal (ex.: WhatsApp/Meta) e não serve ao bridge.
+func (c *ChatwootAdminClient) GetFirstInbox(ctx context.Context, accountID int, accountToken string) (*models.ChatwootCreateInboxResponse, error) {
+	inboxes, err := c.listInboxes(ctx, accountID, accountToken)
+	if err != nil {
+		return nil, err
+	}
+	if len(inboxes) == 0 {
 		return nil, fmt.Errorf("no inboxes found for account %d", accountID)
 	}
-	return &result.Payload[0], nil
+	return &inboxes[0], nil
 }
 
 // UpdateInboxWebhook configura a URL de webhook específica de uma Inbox (Caixa de Entrada)
@@ -833,7 +878,17 @@ func (c *ChatwootAdminClient) searchExistingConversation(ctx context.Context, ac
 
 // FindOrCreateConversation busca uma conversa open/pending para contact+inbox;
 // se não existir, cria uma nova.
-func (c *ChatwootAdminClient) FindOrCreateConversation(ctx context.Context, accountID int, inboxID int, contactID int) (*models.ChatwootConversation, error) {
+//
+// sourceID é o source_id do contact_inbox a enviar ao Chatwoot. Quando a inbox
+// de destino é Channel::Whatsapp, o Chatwoot valida o formato e só aceita o
+// wa_id do contato (dígitos, sem "+", até 15) ou o formato LID
+// "[A-Z]{2}.(ENT.)?[A-Za-z0-9]{1,128}" — enviar um source_id arbitrário
+// (ex.: "whatsapp-<contactId>") resulta em 422 "invalid source id for whatsapp
+// inbox" e derruba a entrega da mensagem. Por isso o caller deve passar os
+// dígitos do telefone resolvido (ver handleIncomingMessage). Em inboxes
+// Channel::Api qualquer string é aceita; os dígitos continuam servindo como
+// source_id estável por contato.
+func (c *ChatwootAdminClient) FindOrCreateConversation(ctx context.Context, accountID int, inboxID int, contactID int, sourceID string) (*models.ChatwootConversation, error) {
 	if contactID == 0 {
 		return nil, fmt.Errorf("FindOrCreateConversation: contactID must be non-zero (account_id=%d, inbox_id=%d)", accountID, inboxID)
 	}
@@ -852,10 +907,21 @@ func (c *ChatwootAdminClient) FindOrCreateConversation(ctx context.Context, acco
 		return existing, nil
 	}
 
+	// Normaliza o source_id: wa_id nunca leva "+" e o Chatwoot rejeita com 422
+	// se vier com ele em inbox Channel::Whatsapp.
+	sourceID = strings.TrimPrefix(sourceID, "+")
+	if sourceID == "" {
+		// Fallback apenas para compatibilidade com a convenção antiga usada em
+		// inboxes Channel::Api (qualquer string é válida lá). Em Channel::Whatsapp
+		// isto ainda seria rejeitado — mas source_id vazio aqui indica ausência
+		// de telefone, caso que já não deveria chegar até este ponto.
+		sourceID = fmt.Sprintf("whatsapp-%d", contactID)
+	}
+
 	// Nenhuma conversa open/pending — cria nova.
 	createURL := fmt.Sprintf("%s/api/v1/accounts/%d/conversations", c.baseURL, accountID)
 	reqBody := models.ChatwootCreateConversationRequest{
-		SourceID:  fmt.Sprintf("whatsapp-%d", contactID),
+		SourceID:  sourceID,
 		ContactID: contactID,
 		InboxID:   inboxID,
 	}

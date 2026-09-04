@@ -58,6 +58,31 @@ func (b *BridgeService) SetMetrics(m *observability.MetricsCollector) {
 	b.metrics = m
 }
 
+// EnsureDefaultInbox garante que a tabela chatwoot_inboxes aponte para a inbox
+// Channel::Api da conta — a inbox do bridge. Auto-corrige o caso em que o
+// fallback histórico gravou uma inbox de outro canal (ex.: Channel::Whatsapp,
+// Meta Cloud API) com rótulo 'api' na tabela local: nessa situação o Chatwoot
+// rejeita a criação de conversa com 422 "invalid source id for whatsapp inbox"
+// porque o destino real é uma inbox WhatsApp, não a inbox API do bridge.
+// Chamado no boot (best-effort) e usado quando a tabela local está vazia.
+// Assume uma única inbox Channel::Api por conta.
+func (b *BridgeService) EnsureDefaultInbox(ctx context.Context) error {
+	if b.inboxRepo == nil {
+		return fmt.Errorf("inbox repository not configured")
+	}
+	client := NewChatwootAdminClient(b.chatwoot.InternalURL, b.chatwoot.APIToken)
+	inbox, err := client.GetAPIInbox(ctx, b.chatwoot.AccountID, b.chatwoot.APIToken)
+	if err != nil {
+		return err
+	}
+	zap.L().Info("syncing bridge default inbox (Channel::Api)",
+		zap.Int("account_id", b.chatwoot.AccountID),
+		zap.Int("inbox_id", inbox.ID),
+		zap.String("inbox_name", inbox.Name),
+	)
+	return b.inboxRepo.ReplaceDefaultInbox(ctx, b.chatwoot.AccountID, inbox.ID, inbox.Name)
+}
+
 // ValidateChatwootWebhookSecret valida a assinatura HMAC-SHA256 do webhook Chatwoot
 // contra o secret único fixo da conta (CHATWOOT_WEBHOOK_SECRET) — não há mais
 // lookup por tenant, só existe uma conta Chatwoot.
@@ -309,10 +334,15 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 	if len(phoneNumber) > 0 && phoneNumber[0] != '+' {
 		phoneNumber = "+" + phoneNumber
 	}
+	// sourceID do contact_inbox no Chatwoot: wa_id do contato (dígitos sem "+").
+	// Inbox Channel::Whatsapp só aceita este formato (ou o padrão LID) como
+	// source_id — qualquer outra string (ex.: "whatsapp-<id>") retorna 422.
+	phoneSourceID := strings.TrimPrefix(phoneNumber, "+")
 
 	logger.Info("processing incoming message",
 		zap.Int("account_id", accountID),
 		zap.String("phone_number", phoneNumber),
+		zap.String("source_id", phoneSourceID),
 	)
 
 	// 3. Encontra ou cria contato
@@ -332,20 +362,23 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 	// 4. Encontra ou cria conversa
 	inboxID, err := b.inboxRepo.GetDefaultInboxID(ctx)
 	if err != nil {
-		// Fallback: busca o primeiro inbox no Chatwoot e salva localmente
-		logger.Warn("inbox not in local DB, fetching from Chatwoot", zap.Error(err))
-		inbox, inboxErr := chatwootClient.GetFirstInbox(ctx, accountID, b.chatwoot.APIToken)
+		// Fallback: busca a inbox Channel::Api (a inbox do bridge) no Chatwoot e
+		// salva localmente. NUNCA usar o primeiro inbox da conta — pode ser uma
+		// inbox Channel::Whatsapp (ex.: Meta Cloud API), o que faz o Chatwoot
+		// rejeitar a conversa com 422 "invalid source id".
+		logger.Warn("inbox not in local DB, fetching Channel::Api inbox from Chatwoot", zap.Error(err))
+		inbox, inboxErr := chatwootClient.GetAPIInbox(ctx, accountID, b.chatwoot.APIToken)
 		if inboxErr != nil {
-			logger.Error("failed to get inbox from chatwoot", zap.Error(inboxErr))
+			logger.Error("failed to get Channel::Api inbox from chatwoot", zap.Error(inboxErr))
 			return inboxErr
 		}
 		inboxID = inbox.ID
 		// Salva para próximas requisições
-		_ = b.inboxRepo.SaveInbox(ctx, accountID, inbox.ID, inbox.Name)
+		_ = b.inboxRepo.ReplaceDefaultInbox(ctx, accountID, inbox.ID, inbox.Name)
 		logger.Info("inbox fetched from chatwoot and cached", zap.Int("inbox_id", inboxID))
 	}
 
-	conversation, err := chatwootClient.FindOrCreateConversation(ctx, accountID, inboxID, contact.ID)
+	conversation, err := chatwootClient.FindOrCreateConversation(ctx, accountID, inboxID, contact.ID, phoneSourceID)
 	if err != nil {
 		logger.Error("failed to find/create conversation", zap.Error(err))
 		return err
@@ -422,12 +455,12 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 			return fmt.Errorf("[Recovery] re-synced contact has ID=0 for phone=%s", phoneNumber)
 		}
 		// Re-fetch inbox (invalida inboxID em memória)
-		if freshInbox, inboxErr := chatwootClient.GetFirstInbox(ctx, accountID, b.chatwoot.APIToken); inboxErr == nil {
+		if freshInbox, inboxErr := chatwootClient.GetAPIInbox(ctx, accountID, b.chatwoot.APIToken); inboxErr == nil {
 			inboxID = freshInbox.ID
-			_ = b.inboxRepo.SaveInbox(ctx, accountID, freshInbox.ID, freshInbox.Name)
+			_ = b.inboxRepo.ReplaceDefaultInbox(ctx, accountID, freshInbox.ID, freshInbox.Name)
 		}
 		// Re-fetch conversa com IDs frescos
-		freshConv, recovErr := chatwootClient.FindOrCreateConversation(ctx, accountID, inboxID, freshContact.ID)
+		freshConv, recovErr := chatwootClient.FindOrCreateConversation(ctx, accountID, inboxID, freshContact.ID, phoneSourceID)
 		if recovErr != nil {
 			logger.Error("[Recovery] FAILED: could not re-sync conversation", zap.Error(recovErr))
 			return recovErr
