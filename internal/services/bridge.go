@@ -58,31 +58,6 @@ func (b *BridgeService) SetMetrics(m *observability.MetricsCollector) {
 	b.metrics = m
 }
 
-// EnsureDefaultInbox garante que a tabela chatwoot_inboxes aponte para a inbox
-// Channel::Api da conta — a inbox do bridge. Auto-corrige o caso em que o
-// fallback histórico gravou uma inbox de outro canal (ex.: Channel::Whatsapp,
-// Meta Cloud API) com rótulo 'api' na tabela local: nessa situação o Chatwoot
-// rejeita a criação de conversa com 422 "invalid source id for whatsapp inbox"
-// porque o destino real é uma inbox WhatsApp, não a inbox API do bridge.
-// Chamado no boot (best-effort) e usado quando a tabela local está vazia.
-// Assume uma única inbox Channel::Api por conta.
-func (b *BridgeService) EnsureDefaultInbox(ctx context.Context) error {
-	if b.inboxRepo == nil {
-		return fmt.Errorf("inbox repository not configured")
-	}
-	client := NewChatwootAdminClient(b.chatwoot.InternalURL, b.chatwoot.APIToken)
-	inbox, err := client.GetAPIInbox(ctx, b.chatwoot.AccountID, b.chatwoot.APIToken)
-	if err != nil {
-		return err
-	}
-	zap.L().Info("syncing bridge default inbox (Channel::Api)",
-		zap.Int("account_id", b.chatwoot.AccountID),
-		zap.Int("inbox_id", inbox.ID),
-		zap.String("inbox_name", inbox.Name),
-	)
-	return b.inboxRepo.ReplaceDefaultInbox(ctx, b.chatwoot.AccountID, inbox.ID, inbox.Name)
-}
-
 // ValidateChatwootWebhookSecret valida a assinatura HMAC-SHA256 do webhook Chatwoot
 // contra o secret único fixo da conta (CHATWOOT_WEBHOOK_SECRET) — não há mais
 // lookup por tenant, só existe uma conta Chatwoot.
@@ -315,10 +290,29 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 	// Resolve a instância diretamente pelo nome (?instance= na URL do webhook) —
 	// não há mais tenant para desambiguar; cada instância Evolution existe
 	// isoladamente e pertence sempre à única conta Chatwoot da Cartão Pro.
-	if _, err := b.instanceRepo.FindByInstanceName(ctx, webhook.InstanceName); err != nil {
+	instance, err := b.instanceRepo.FindByInstanceName(ctx, webhook.InstanceName)
+	if err != nil {
 		logger.Error("instance not found by name", zap.Error(err))
 		return fmt.Errorf("instance %s not found: %w", webhook.InstanceName, err)
 	}
+
+	// VÍNCULO OBRIGATÓRIO — roteamento por instância: cada instância precisa ter
+	// uma inbox Chatwoot vinculada (cadastrada no dashboard via create/update do
+	// vínculo). Sem vínculo a mensagem NÃO é entregue: com várias caixas na
+	// conta, cair numa inbox "default" poderia misturar atendimentos de números
+	// diferentes. A resolução deixa de usar a tabela global chatwoot_inboxes.
+	inboxID := 0
+	if instance.ChatwootInboxID == nil {
+		logger.Error("instance has no linked chatwoot inbox — message NOT delivered",
+			zap.String("instance", webhook.InstanceName),
+			zap.String("hint", "vincule uma inbox Chatwoot no dashboard (PUT /api/v1/admin/instances/{name}/inbox)"),
+		)
+		return fmt.Errorf("instance %s has no linked chatwoot inbox; message not delivered — link one before receiving messages", webhook.InstanceName)
+	}
+	inboxID = *instance.ChatwootInboxID
+	logger.Info("inbound routed to linked chatwoot inbox",
+		zap.Int("inbox_id", inboxID),
+	)
 
 	chatwootClient := NewChatwootAdminClient(b.chatwoot.InternalURL, b.chatwoot.APIToken)
 	accountID := b.chatwoot.AccountID
@@ -359,25 +353,8 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 	}
 	logger.Info("Step 1: Contact ID resolved", zap.Int("contact_id", contact.ID))
 
-	// 4. Encontra ou cria conversa
-	inboxID, err := b.inboxRepo.GetDefaultInboxID(ctx)
-	if err != nil {
-		// Fallback: busca a inbox Channel::Api (a inbox do bridge) no Chatwoot e
-		// salva localmente. NUNCA usar o primeiro inbox da conta — pode ser uma
-		// inbox Channel::Whatsapp (ex.: Meta Cloud API), o que faz o Chatwoot
-		// rejeitar a conversa com 422 "invalid source id".
-		logger.Warn("inbox not in local DB, fetching Channel::Api inbox from Chatwoot", zap.Error(err))
-		inbox, inboxErr := chatwootClient.GetAPIInbox(ctx, accountID, b.chatwoot.APIToken)
-		if inboxErr != nil {
-			logger.Error("failed to get Channel::Api inbox from chatwoot", zap.Error(inboxErr))
-			return inboxErr
-		}
-		inboxID = inbox.ID
-		// Salva para próximas requisições
-		_ = b.inboxRepo.ReplaceDefaultInbox(ctx, accountID, inbox.ID, inbox.Name)
-		logger.Info("inbox fetched from chatwoot and cached", zap.Int("inbox_id", inboxID))
-	}
-
+	// 4. Encontra ou cria conversa na inbox Chatwoot vinculada à instância
+	// (resolvida no passo 2 — vínculo obrigatório, roteamento por instância).
 	conversation, err := chatwootClient.FindOrCreateConversation(ctx, accountID, inboxID, contact.ID, phoneSourceID)
 	if err != nil {
 		logger.Error("failed to find/create conversation", zap.Error(err))
@@ -454,11 +431,9 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 		if freshContact.ID == 0 {
 			return fmt.Errorf("[Recovery] re-synced contact has ID=0 for phone=%s", phoneNumber)
 		}
-		// Re-fetch inbox (invalida inboxID em memória)
-		if freshInbox, inboxErr := chatwootClient.GetAPIInbox(ctx, accountID, b.chatwoot.APIToken); inboxErr == nil {
-			inboxID = freshInbox.ID
-			_ = b.inboxRepo.ReplaceDefaultInbox(ctx, accountID, freshInbox.ID, freshInbox.Name)
-		}
+		// Inbox NÃO é re-resolvida no recovery: com vínculo obrigatório ela vem do
+		// binding da instância (inboxID do passo 2). Se a inbox vinculada tiver
+		// sumido no Chatwoot, o recovery não deve cair numa inbox "default".
 		// Re-fetch conversa com IDs frescos
 		freshConv, recovErr := chatwootClient.FindOrCreateConversation(ctx, accountID, inboxID, freshContact.ID, phoneSourceID)
 		if recovErr != nil {

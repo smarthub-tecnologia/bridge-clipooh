@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -44,6 +45,75 @@ func (h *AdminHandler) CreateInstance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusCreated, resp)
+}
+
+// GetInstanceChatwootInbox GET /api/v1/admin/instances/{instanceName}/inbox —
+// devolve o vínculo atual da instância com a inbox Chatwoot.
+func (h *AdminHandler) GetInstanceChatwootInbox(w http.ResponseWriter, r *http.Request) {
+	instanceName := chi.URLParam(r, "instanceName")
+
+	binding, err := h.adminService.GetInstanceChatwootInbox(r.Context(), instanceName)
+	if err != nil {
+		if strings.Contains(err.Error(), "no rows") || strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "INSTANCE_NOT_FOUND", err.Error(), nil)
+			return
+		}
+		zap.L().Error("failed to get instance chatwoot inbox", zap.String("instance", instanceName), zap.Error(err))
+		respondError(w, http.StatusInternalServerError, "GET_INBOX_BINDING_FAILED", err.Error(), nil)
+		return
+	}
+
+	if binding == nil {
+		// Instância existe mas ainda não tem inbox vinculada.
+		respondJSON(w, http.StatusOK, services.ChatwootInboxBinding{})
+		return
+	}
+	respondJSON(w, http.StatusOK, binding)
+}
+
+// SetInstanceChatwootInbox PUT /api/v1/admin/instances/{instanceName}/inbox —
+// vincula (ou substitui) a inbox Chatwoot da instância. Corpo é o mesmo objeto
+// usado no form de criação: { inbox_id, inbox_name?, webhook_secret?, inbox_identifier? }.
+func (h *AdminHandler) SetInstanceChatwootInbox(w http.ResponseWriter, r *http.Request) {
+	instanceName := chi.URLParam(r, "instanceName")
+
+	var binding services.ChatwootInboxBinding
+	if err := json.NewDecoder(r.Body).Decode(&binding); err != nil {
+		respondError(w, http.StatusBadRequest, "INVALID_PAYLOAD", "Invalid request body", nil)
+		return
+	}
+
+	saved, err := h.adminService.SetInstanceChatwootInbox(r.Context(), instanceName, binding)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "INSTANCE_NOT_FOUND", err.Error(), nil)
+			return
+		}
+		zap.L().Error("failed to set instance chatwoot inbox", zap.String("instance", instanceName), zap.Error(err))
+		respondError(w, http.StatusInternalServerError, "SET_INBOX_BINDING_FAILED", err.Error(), nil)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, saved)
+}
+
+// RemoveInstanceChatwootInbox DELETE /api/v1/admin/instances/{instanceName}/inbox —
+// remove o vínculo da instância com a inbox Chatwoot. A partir daí a instância
+// para de entregar mensagens (vínculo obrigatório no roteamento inbound).
+func (h *AdminHandler) RemoveInstanceChatwootInbox(w http.ResponseWriter, r *http.Request) {
+	instanceName := chi.URLParam(r, "instanceName")
+
+	if err := h.adminService.RemoveInstanceChatwootInbox(r.Context(), instanceName); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			respondError(w, http.StatusNotFound, "INSTANCE_NOT_FOUND", err.Error(), nil)
+			return
+		}
+		zap.L().Error("failed to remove instance chatwoot inbox", zap.String("instance", instanceName), zap.Error(err))
+		respondError(w, http.StatusInternalServerError, "REMOVE_INBOX_BINDING_FAILED", err.Error(), nil)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "unbound"})
 }
 
 // CreateWidgetInbox cria uma inbox tipo Website (widget público) na conta

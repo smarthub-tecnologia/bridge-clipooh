@@ -23,8 +23,14 @@ type EvolutionInstance struct {
 	MessagesReceived int                    `json:"messages_received"`
 	Config           map[string]interface{} `json:"config,omitempty"`
 	Metadata         map[string]interface{} `json:"metadata,omitempty"`
-	CreatedAt        time.Time              `json:"created_at"`
-	UpdatedAt        time.Time              `json:"updated_at"`
+	// Vínculo com a inbox Chatwoot (obrigatório para entrega de mensagens).
+	// Preenchido pelo dashboard no provisionamento/edição da instância.
+	ChatwootInboxID            *int      `json:"chatwoot_inbox_id,omitempty" db:"chatwoot_inbox_id"`
+	ChatwootInboxName          *string   `json:"chatwoot_inbox_name,omitempty" db:"chatwoot_inbox_name"`
+	ChatwootInboxWebhookSecret *string   `json:"chatwoot_inbox_webhook_secret,omitempty" db:"chatwoot_inbox_webhook_secret"`
+	ChatwootInboxIdentifier    *string   `json:"chatwoot_inbox_identifier,omitempty" db:"chatwoot_inbox_identifier"`
+	CreatedAt                  time.Time `json:"created_at"`
+	UpdatedAt                  time.Time `json:"updated_at"`
 }
 
 type EvolutionAdvancedSettings struct {

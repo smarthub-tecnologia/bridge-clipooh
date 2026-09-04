@@ -54,16 +54,34 @@ func NewAdminService(
 	}
 }
 
+// ChatwootInboxBinding representa o vínculo de uma instância Evolution com uma
+// inbox Chatwoot (Channel::Api) criada no dashboard. Dados devolvidos pelo
+// Chatwoot ao criar a caixa: inbox_id (id numérico), webhook_secret (usado na
+// assinatura HMAC do webhook de saída) e inbox_identifier da inbox.
+type ChatwootInboxBinding struct {
+	InboxID       int    `json:"inbox_id"`
+	InboxName     string `json:"inbox_name,omitempty"`
+	WebhookSecret string `json:"webhook_secret,omitempty"`
+	Identifier    string `json:"inbox_identifier,omitempty"`
+}
+
 // CreateInstanceRequest payload recebido do dashboard para provisionar uma
 // nova linha WhatsApp (instância Evolution GO) na conta Cartão Pro já existente.
+// ChatwootInbox é opcional no provisionamento, mas OBRIGATÓRIO para que a
+// instância receba mensagens (ver roteamento em handleIncomingMessage).
 type CreateInstanceRequest struct {
-	InstanceName string `json:"instance_name"`
+	InstanceName  string                `json:"instance_name"`
+	ChatwootInbox *ChatwootInboxBinding `json:"chatwoot_inbox,omitempty"`
 }
 
 // CreateInstanceResponse resposta da criação de instância.
+// ChatwootInboxBound indica se a instância já nasceu com inbox Chatwoot
+// vinculada; sem vínculo ela não entrega mensagens (vínculo obrigatório).
 type CreateInstanceResponse struct {
-	InstanceName string `json:"instance_name"`
-	Status       string `json:"status"`
+	InstanceName       string `json:"instance_name"`
+	Status             string `json:"status"`
+	ChatwootInboxBound bool   `json:"chatwoot_inbox_bound"`
+	ChatwootInboxID    *int   `json:"chatwoot_inbox_id,omitempty"`
 }
 
 // CreateInstance provisiona uma nova instância Evolution GO (linha WhatsApp)
@@ -147,6 +165,26 @@ func (s *AdminService) CreateInstance(ctx context.Context, req CreateInstanceReq
 		)
 	}
 
+	// Vínculo com a inbox Chatwoot (opcional no create; se vier, já persiste junto
+	// — sem isso a instância fica sem vínculo e não entrega mensagens até o
+	// dashboard vincular uma inbox via PUT /instances/{name}/inbox).
+	if req.ChatwootInbox != nil && req.ChatwootInbox.InboxID > 0 {
+		newInstance.ChatwootInboxID = &req.ChatwootInbox.InboxID
+		if req.ChatwootInbox.InboxName != "" {
+			newInstance.ChatwootInboxName = &req.ChatwootInbox.InboxName
+		}
+		if req.ChatwootInbox.WebhookSecret != "" {
+			newInstance.ChatwootInboxWebhookSecret = &req.ChatwootInbox.WebhookSecret
+		}
+		if req.ChatwootInbox.Identifier != "" {
+			newInstance.ChatwootInboxIdentifier = &req.ChatwootInbox.Identifier
+		}
+		logger.Info("instance provisioned with chatwoot inbox binding",
+			zap.Int("inbox_id", req.ChatwootInbox.InboxID),
+			zap.String("inbox_name", req.ChatwootInbox.InboxName),
+		)
+	}
+
 	if err := s.instanceRepo.Create(ctx, newInstance); err != nil {
 		logger.Error("CRITICAL: evolution instance created in API but failed to persist to DB — orphan instance",
 			zap.String("instance_id", newInstance.InstanceID),
@@ -158,10 +196,79 @@ func (s *AdminService) CreateInstance(ctx context.Context, req CreateInstanceReq
 
 	logger.Info("instance provisioned successfully", zap.String("instance_name", evolutionResp.Name))
 
-	return &CreateInstanceResponse{
+	resp := &CreateInstanceResponse{
 		InstanceName: evolutionResp.Name,
 		Status:       "created",
-	}, nil
+	}
+	if newInstance.ChatwootInboxID != nil {
+		resp.ChatwootInboxBound = true
+		resp.ChatwootInboxID = newInstance.ChatwootInboxID
+	} else {
+		logger.Warn("instance provisioned WITHOUT chatwoot inbox binding — inbound messages will NOT be delivered until a inbox is linked",
+			zap.String("instance_name", evolutionResp.Name),
+		)
+	}
+	return resp, nil
+}
+
+// GetInstanceChatwootInbox devolve o vínculo atual da instância com a inbox
+// Chatwoot. Retorna (nil, nil) quando a instância não tem vínculo.
+func (s *AdminService) GetInstanceChatwootInbox(ctx context.Context, instanceName string) (*ChatwootInboxBinding, error) {
+	instance, err := s.instanceRepo.FindByInstanceName(ctx, instanceName)
+	if err != nil {
+		return nil, err
+	}
+	if instance.ChatwootInboxID == nil {
+		return nil, nil
+	}
+	binding := &ChatwootInboxBinding{
+		InboxID: *instance.ChatwootInboxID,
+	}
+	if instance.ChatwootInboxName != nil {
+		binding.InboxName = *instance.ChatwootInboxName
+	}
+	if instance.ChatwootInboxWebhookSecret != nil {
+		binding.WebhookSecret = *instance.ChatwootInboxWebhookSecret
+	}
+	if instance.ChatwootInboxIdentifier != nil {
+		binding.Identifier = *instance.ChatwootInboxIdentifier
+	}
+	return binding, nil
+}
+
+// SetInstanceChatwootInbox vincula (ou substitui) a inbox Chatwoot de uma
+// instância. Valida só o mínimo (inbox_id > 0); a existência real da inbox é
+// responsabilidade do dashboard, que acabou de criá-la no Chatwoot.
+func (s *AdminService) SetInstanceChatwootInbox(ctx context.Context, instanceName string, binding ChatwootInboxBinding) (*ChatwootInboxBinding, error) {
+	if instanceName == "" {
+		return nil, fmt.Errorf("instance name is required")
+	}
+	if binding.InboxID <= 0 {
+		return nil, fmt.Errorf("inbox_id is required and must be a positive integer")
+	}
+	if err := s.instanceRepo.BindChatwootInbox(ctx, instanceName, binding.InboxID, binding.InboxName, binding.WebhookSecret, binding.Identifier); err != nil {
+		return nil, err
+	}
+	zap.L().Info("chatwoot inbox bound to instance",
+		zap.String("instance", instanceName),
+		zap.Int("inbox_id", binding.InboxID),
+		zap.String("inbox_name", binding.InboxName),
+	)
+	return &binding, nil
+}
+
+// RemoveInstanceChatwootInbox remove o vínculo da instância com a inbox
+// Chatwoot. Instância sem vínculo deixa de entregar mensagens (vínculo
+// obrigatório no roteamento inbound).
+func (s *AdminService) RemoveInstanceChatwootInbox(ctx context.Context, instanceName string) error {
+	if instanceName == "" {
+		return fmt.Errorf("instance name is required")
+	}
+	if err := s.instanceRepo.ClearChatwootInbox(ctx, instanceName); err != nil {
+		return err
+	}
+	zap.L().Info("chatwoot inbox unbound from instance", zap.String("instance", instanceName))
+	return nil
 }
 
 // CreateWidgetInboxResponse é o retorno do endpoint admin de criação de inbox

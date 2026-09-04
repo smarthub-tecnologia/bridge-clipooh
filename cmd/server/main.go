@@ -250,6 +250,9 @@ func main() {
 			})
 		})
 		r.Post("/instances", adminHandler.CreateInstance)
+		r.Get("/instances/{instanceName}/inbox", adminHandler.GetInstanceChatwootInbox)
+		r.Put("/instances/{instanceName}/inbox", adminHandler.SetInstanceChatwootInbox)
+		r.Delete("/instances/{instanceName}/inbox", adminHandler.RemoveInstanceChatwootInbox)
 		r.Post("/chatwoot-widget-inbox", adminHandler.CreateWidgetInbox)
 		r.Post("/chatwoot-widget-webhook/sync", adminHandler.SyncWidgetWebhook)
 		r.Post("/agents", adminHandler.CreateAgent)
@@ -300,23 +303,6 @@ func main() {
 		}
 	}
 	go adminService.RunWebhookHealthChecker(ctx, healthCheckInterval)
-
-	// Sincroniza a tabela chatwoot_inboxes com a inbox Channel::Api real da conta
-	// (best-effort, não bloqueia o boot). Corrige sozinho o caso em que o
-	// fallback histórico gravou uma inbox de outro canal (ex.: Channel::Whatsapp
-	// do Meta Cloud API) como default — isso faz o Chatwoot rejeitar a criação
-	// de conversa com 422 "invalid source id for whatsapp inbox".
-	go func() {
-		ctxSync, cancelSync := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancelSync()
-		if err := bridgeService.EnsureDefaultInbox(ctxSync); err != nil {
-			zap.L().Warn("failed to sync bridge default inbox (Channel::Api) — inbound pode falhar até corrigir",
-				zap.Error(err),
-			)
-			return
-		}
-		zap.L().Info("bridge default inbox synced to Channel::Api inbox")
-	}()
 
 	go func() {
 		logger.Info("wa-bridge starting", zap.String("port", port))
