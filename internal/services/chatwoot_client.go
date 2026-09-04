@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"time"
@@ -1015,6 +1016,11 @@ func (c *ChatwootAdminClient) CreateMessage(ctx context.Context, accountID int, 
 	return &result, nil
 }
 
+// quoteEscaper replica o escapamento usado internamente por
+// mime/multipart.Writer.CreateFormFile (não exportado) para o valor de
+// filename no header Content-Disposition.
+var quoteEscaper = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
+
 // CreateMessageWithAttachment cria uma mensagem com um arquivo anexado. A API
 // pública do Chatwoot só aceita anexos via multipart/form-data no campo
 // attachments[] — não existe um endpoint JSON equivalente a data_url, então
@@ -1032,7 +1038,19 @@ func (c *ChatwootAdminClient) CreateMessageWithAttachment(ctx context.Context, a
 			return nil, err
 		}
 	}
-	part, err := writer.CreateFormFile("attachments[]", fileName)
+	// writer.CreateFormFile fixaria Content-Type: application/octet-stream na
+	// parte do arquivo (é hardcoded na stdlib) — o Chatwoot deriva o
+	// file_type do anexo (image/video/audio/file) desse Content-Type via
+	// ActiveStorage, não da extensão do nome do arquivo. Sem o mimetype real
+	// aqui, toda mídia (imagem incluída) cai no cartão genérico de arquivo em
+	// vez de renderizar a prévia inline.
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	partHeader := textproto.MIMEHeader{}
+	partHeader.Set("Content-Disposition", fmt.Sprintf(`form-data; name="attachments[]"; filename="%s"`, quoteEscaper.Replace(fileName)))
+	partHeader.Set("Content-Type", mimeType)
+	part, err := writer.CreatePart(partHeader)
 	if err != nil {
 		return nil, err
 	}
