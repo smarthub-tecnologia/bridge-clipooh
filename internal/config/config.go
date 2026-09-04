@@ -144,12 +144,21 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Chatwoot.AdminAPIURL == "" {
 		cfg.Chatwoot.AdminAPIURL = viper.GetString("CHATWOOT_ADMIN_API_URL")
 	}
-	if cfg.Chatwoot.WebhookBase == "" || strings.HasPrefix(cfg.Chatwoot.WebhookBase, "${") {
-		// WEBHOOK_BASE_URL é o nome preferido (ex: https://bridge.mobiochat.com)
-		cfg.Chatwoot.WebhookBase = viper.GetString("WEBHOOK_BASE_URL")
-	}
-	if cfg.Chatwoot.WebhookBase == "" || strings.HasPrefix(cfg.Chatwoot.WebhookBase, "${") {
-		// Fallback para o nome antigo
+	// WEBHOOK_BASE_URL é o nome preferido (ex: https://bridge.mobiochat.com) e tem
+	// prioridade real sobre CHATWOOT_WEBHOOK_BASE (nome legado, mantido por
+	// compatibilidade — normalmente já vem com o path /webhook/evolution embutido).
+	// Lido via os.Getenv (não viper.GetString) de propósito: cfg.Chatwoot.WebhookBase
+	// já pode ter sido preenchido pelo Unmarshal a partir de CHATWOOT_WEBHOOK_BASE
+	// (viper.AutomaticEnv resolve a chave "chatwoot.webhook_base" do config.yaml
+	// contra essa env var antes deste ponto), então checar "== \"\" || HasPrefix(\"${\")"
+	// aqui nunca detectaria isso — precisa sobrescrever incondicionalmente quando
+	// WEBHOOK_BASE_URL estiver presente.
+	if v := os.Getenv("WEBHOOK_BASE_URL"); v != "" {
+		cfg.Chatwoot.WebhookBase = v
+	} else if cfg.Chatwoot.WebhookBase == "" || strings.HasPrefix(cfg.Chatwoot.WebhookBase, "${") {
+		// WEBHOOK_BASE_URL ausente — mantém o que o Unmarshal já resolveu
+		// (CHATWOOT_WEBHOOK_BASE via AutomaticEnv), ou cai pro literal não
+		// expandido do config.yaml quando nenhuma das duas env vars existe.
 		cfg.Chatwoot.WebhookBase = viper.GetString("CHATWOOT_WEBHOOK_BASE")
 	}
 

@@ -73,9 +73,6 @@ type CreateInstanceResponse struct {
 func (s *AdminService) CreateInstance(ctx context.Context, req CreateInstanceRequest) (*CreateInstanceResponse, error) {
 	logger := zap.L().With(zap.String("operation", "create_instance"))
 
-	// TEMP DEBUG — remover após diagnóstico de webhook_url duplicada / token sobrescrito
-	logger.Info("DEBUG raw webhookBaseURL", zap.String("raw_webhook_base_url", s.webhookBaseURL))
-
 	var instanceName string
 	shortHash := uuid.New().String()[:6]
 	if req.InstanceName != "" {
@@ -113,10 +110,6 @@ func (s *AdminService) CreateInstance(ctx context.Context, req CreateInstanceReq
 	if evolutionResp.Name == "" {
 		evolutionResp.Name = instanceName
 	}
-
-	// TEMP DEBUG — remover após diagnóstico de webhook_url duplicada / token sobrescrito
-	logger.Info("DEBUG evolution create instance response", zap.Any("evolution_create_response", evolutionResp))
-
 	evolutionResp.Token = instanceToken
 
 	expandedWebhookBase := os.ExpandEnv(s.webhookBaseURL)
