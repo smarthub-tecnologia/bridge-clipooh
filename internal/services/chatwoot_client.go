@@ -832,17 +832,16 @@ func (c *ChatwootAdminClient) searchExistingConversation(ctx context.Context, ac
 		return nil, nil
 	}
 
-	// Struct anônimo que captura inbox_id da raiz E de meta.channel como fallback,
-	// cobrindo variações entre versões do Chatwoot.
+	// meta.channel vem como string (ex.: "Channel::Api", "Channel::Whatsapp"),
+	// não como objeto {id: int} — não serve como fallback de inbox_id, que já
+	// vem preenchido na raiz de cada item do payload.
 	var result struct {
 		Payload []struct {
 			ID      int    `json:"id"`
 			Status  string `json:"status"`
 			InboxID int    `json:"inbox_id"`
 			Meta    struct {
-				Channel struct {
-					ID int `json:"id"`
-				} `json:"channel"`
+				Channel string `json:"channel"`
 			} `json:"meta"`
 		} `json:"payload"`
 	}
@@ -861,11 +860,13 @@ func (c *ChatwootAdminClient) searchExistingConversation(ctx context.Context, ac
 	)
 
 	for _, item := range result.Payload {
-		convInboxID := item.InboxID
-		if convInboxID == 0 {
-			convInboxID = item.Meta.Channel.ID
-		}
-		if convInboxID == inboxID && (item.Status == "open" || item.Status == "pending") {
+		if item.InboxID == inboxID && (item.Status == "open" || item.Status == "pending") {
+			zap.L().Info("Step 1: Found existing conversation",
+				zap.Int("conversation_id", item.ID),
+				zap.String("status", item.Status),
+				zap.Int("contact_id", contactID),
+				zap.Int("inbox_id", inboxID),
+			)
 			return &models.ChatwootConversation{
 				ID:      item.ID,
 				InboxID: inboxID,
