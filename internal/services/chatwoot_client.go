@@ -3,10 +3,10 @@ package services
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
@@ -1015,10 +1015,57 @@ func (c *ChatwootAdminClient) CreateMessage(ctx context.Context, accountID int, 
 	return &result, nil
 }
 
-// UploadAttachment constructs a data URL for chatwoot attachment using base64
-func (c *ChatwootAdminClient) UploadAttachment(ctx context.Context, accountID int, fileBytes []byte, fileName, mimeType string) (string, error) {
-	encoded := base64.StdEncoding.EncodeToString(fileBytes)
-	return fmt.Sprintf("data:%s;base64,%s", mimeType, encoded), nil
+// CreateMessageWithAttachment cria uma mensagem com um arquivo anexado. A API
+// pública do Chatwoot só aceita anexos via multipart/form-data no campo
+// attachments[] — não existe um endpoint JSON equivalente a data_url, então
+// isto não pode reaproveitar CreateMessage (que envia application/json).
+func (c *ChatwootAdminClient) CreateMessageWithAttachment(ctx context.Context, accountID, conversationID int, content string, fileBytes []byte, fileName, mimeType string) (*models.ChatwootCreateMessageResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/accounts/%d/conversations/%d/messages", c.baseURL, accountID, conversationID)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("message_type", "incoming"); err != nil {
+		return nil, err
+	}
+	if content != "" {
+		if err := writer.WriteField("content", content); err != nil {
+			return nil, err
+		}
+	}
+	part, err := writer.CreateFormFile("attachments[]", fileName)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := part.Write(fileBytes); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
+	httpReq, err := retryablehttp.NewRequestWithContext(ctx, "POST", url, body.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
+	httpReq.Header.Set("api_access_token", c.apiToken)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		rawBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("chatwoot api error uploading attachment: status %d, body: %s", resp.StatusCode, string(rawBody))
+	}
+
+	var result models.ChatwootCreateMessageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // GetConversationCustomAttributes busca os atributos customizados de uma conversa

@@ -390,51 +390,101 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 	var messageReq models.ChatwootCreateMessageRequest
 	messageReq.MessageType = "incoming"
 
-	switch info.Type {
-	case "Conversation", "ExtendedTextMessage", "text", "extendedText", "conversation":
+	// isMedia + mediaBytes/mediaFileName/mediaMimetype alimentam o closure
+	// `send` abaixo, que escolhe entre CreateMessage (texto, JSON) e
+	// CreateMessageWithAttachment (mídia, multipart) — inclusive no retry por
+	// ID obsoleto, que precisa reenviar exatamente o mesmo conteúdo.
+	var (
+		isMedia       bool
+		mediaBytes    []byte
+		mediaFileName string
+		mediaMimetype string
+	)
+
+	switch {
+	case info.Type == "text" || info.Type == "Conversation" || info.Type == "ExtendedTextMessage" ||
+		info.Type == "extendedText" || info.Type == "conversation":
 		messageReq.Content = msg.Text()
 		if messageReq.Content == "" {
 			logger.Warn("empty text message, skipping")
 			return nil
 		}
 
-	case "ImageMessage", "VideoMessage", "AudioMessage", "DocumentMessage",
-		"imageMessage", "videoMessage", "audioMessage", "documentMessage":
+	case info.MediaType != "":
+		if _, supported := waMediaHKDFInfo[info.MediaType]; !supported {
+			logger.Warn("unsupported media_type, skipping", zap.String("media_type", info.MediaType))
+			return nil
+		}
 		media := msg.MediaContent()
-		if media != nil {
-			filePath, err := b.mediaService.DownloadFile(ctx, media.URL)
-			if err != nil {
-				logger.Error("failed to download media", zap.Error(err))
-				return err
-			}
-			defer b.mediaService.Cleanup(filePath)
-
-			fileBytes, err := b.mediaService.ReadFile(filePath)
-			if err != nil {
-				return err
-			}
-			dataURL, err := chatwootClient.UploadAttachment(ctx, accountID, fileBytes, media.FileName, media.Mimetype)
-			if err != nil {
-				return err
-			}
-			messageReq.Attachments = []models.ChatwootAttachmentRequest{{
-				FileName: media.FileName,
-				FileType: media.Mimetype,
-				DataURL:  dataURL,
-			}}
-			if media.Caption != "" {
-				messageReq.Content = media.Caption
-			}
+		if media == nil {
+			logger.Warn("media_type declared but no matching Message.*Message payload found, skipping",
+				zap.String("media_type", info.MediaType),
+			)
+			return nil
 		}
 
+		filePath, err := b.mediaService.DownloadFile(ctx, media.URL)
+		if err != nil {
+			logger.Error("failed to download encrypted media from WhatsApp CDN",
+				zap.String("media_type", info.MediaType),
+				zap.Error(err),
+			)
+			return err
+		}
+		defer b.mediaService.Cleanup(filePath)
+
+		encryptedBytes, err := b.mediaService.ReadFile(filePath)
+		if err != nil {
+			logger.Error("failed to read downloaded media file",
+				zap.String("media_type", info.MediaType),
+				zap.Error(err),
+			)
+			return err
+		}
+
+		mediaBytes, err = decryptWhatsAppMedia(encryptedBytes, media.MediaKey, info.MediaType)
+		if err != nil {
+			logger.Error("failed to decrypt WhatsApp media",
+				zap.String("media_type", info.MediaType),
+				zap.String("mimetype", media.Mimetype),
+				zap.Int("encrypted_bytes", len(encryptedBytes)),
+				zap.Error(err),
+			)
+			return fmt.Errorf("failed to decrypt %s media (message_id=%s): %w", info.MediaType, info.ID, err)
+		}
+
+		mediaMimetype = media.Mimetype
+		mediaFileName = media.FileName
+		if mediaFileName == "" {
+			mediaFileName = defaultMediaFileName(info.ID, info.MediaType, mediaMimetype)
+		}
+		messageReq.Content = media.Caption
+		isMedia = true
+
 	default:
-		logger.Warn("unsupported message type", zap.String("type", info.Type))
+		logger.Warn("unsupported message type", zap.String("type", info.Type), zap.String("media_type", info.MediaType))
 		return nil
+	}
+
+	send := func(convID int) (*models.ChatwootCreateMessageResponse, error) {
+		if isMedia {
+			resp, err := chatwootClient.CreateMessageWithAttachment(ctx, accountID, convID, messageReq.Content, mediaBytes, mediaFileName, mediaMimetype)
+			if err != nil {
+				logger.Error("failed to upload media attachment to chatwoot",
+					zap.String("media_type", info.MediaType),
+					zap.String("file_name", mediaFileName),
+					zap.Int("conversation_id", convID),
+					zap.Error(err),
+				)
+			}
+			return resp, err
+		}
+		return chatwootClient.CreateMessage(ctx, accountID, convID, messageReq)
 	}
 
 	// 7. Envia mensagem para o Chatwoot (com retry único em caso de 404 por ID obsoleto)
 	conversationID := conversation.ID
-	_, sendErr := chatwootClient.CreateMessage(ctx, accountID, conversationID, messageReq)
+	_, sendErr := send(conversationID)
 	if sendErr != nil && strings.Contains(sendErr.Error(), "status 404") {
 		logger.Warn("[Recovery] Stale ID detected. Clearing cache and re-syncing contact...",
 			zap.String("phone_number", phoneNumber),
@@ -466,7 +516,7 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 		chatwootClient.SetCustomAttribute(ctx, accountID, freshConv.ID, "whatsapp_message_id", info.ID)
 		chatwootClient.SetCustomAttribute(ctx, accountID, freshConv.ID, "phone_number", phoneNumber)
 		chatwootClient.SetCustomAttribute(ctx, accountID, freshConv.ID, "evolution_instance", webhook.InstanceName)
-		_, sendErr = chatwootClient.CreateMessage(ctx, accountID, freshConv.ID, messageReq)
+		_, sendErr = send(freshConv.ID)
 		contact = freshContact
 		conversationID = freshConv.ID
 	}

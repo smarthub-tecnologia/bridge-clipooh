@@ -144,14 +144,22 @@ type EvolutionMessageData struct {
 	Status  string               `json:"status,omitempty"` // para eventos de update
 }
 
-// EvolutionMessageInfo metadados da mensagem (campo "Info" do payload Evolution GO)
+// EvolutionMessageInfo metadados da mensagem (campo "Info" do payload Evolution GO,
+// que embute whatsmeow_types.MessageInfo).
+//
+// Type é uma classificação grosseira ("text" ou "media") — não o nome do
+// sub-tipo da mensagem. Para mídia, o sub-tipo real vem em MediaType
+// ("image", "video", "gif", "audio", "ptt", "document", "sticker"); mensagens
+// de vídeo com reprodução em loop chegam como MediaType "gif" (vídeo mp4 com
+// gifPlayback: true no proto), não como um tipo próprio.
 type EvolutionMessageInfo struct {
-	Chat     string `json:"Chat"`     // JID do contato: "5511999@s.whatsapp.net"
-	Sender   string `json:"Sender"`   // JID do remetente (pode diferir em grupos)
-	IsFromMe bool   `json:"IsFromMe"` // true = mensagem enviada pelo bot
-	ID       string `json:"ID"`       // ID único da mensagem
-	Type     string `json:"Type"`     // "ExtendedTextMessage", "Conversation", "ImageMessage", etc.
-	PushName string `json:"PushName"` // nome do contato no WhatsApp
+	Chat      string `json:"Chat"`      // JID do contato: "5511999@s.whatsapp.net"
+	Sender    string `json:"Sender"`    // JID do remetente (pode diferir em grupos)
+	IsFromMe  bool   `json:"IsFromMe"`  // true = mensagem enviada pelo bot
+	ID        string `json:"ID"`        // ID único da mensagem
+	Type      string `json:"Type"`      // "text" ou "media"
+	MediaType string `json:"MediaType"` // "image", "video", "gif", "audio", "ptt", "document", "sticker"
+	PushName  string `json:"PushName"`  // nome do contato no WhatsApp
 }
 
 // EvolutionMessageBody conteúdo da mensagem (campo "Message" do payload Evolution GO)
@@ -198,12 +206,22 @@ type EvolutionExtendedText struct {
 	Text string `json:"text"`
 }
 
-// EvolutionMediaContent conteúdo de mídia (imagem, vídeo, áudio, documento)
+// EvolutionMediaContent conteúdo de mídia (imagem, vídeo, áudio, documento).
+// URL aponta para o blob criptografado no CDN do WhatsApp — MediaKey (e os
+// demais campos abaixo, todos base64 de []byte no proto original) são
+// necessários para derivar as chaves AES/HMAC e descriptografar o arquivo
+// (ver whatsapp_media.go).
 type EvolutionMediaContent struct {
-	URL      string `json:"url"`
-	Mimetype string `json:"mimetype"`
-	FileName string `json:"fileName,omitempty"`
-	Caption  string `json:"caption,omitempty"`
+	URL           string `json:"url"`
+	Mimetype      string `json:"mimetype"`
+	FileName      string `json:"fileName,omitempty"`
+	Caption       string `json:"caption,omitempty"`
+	MediaKey      string `json:"mediaKey,omitempty"`      // base64
+	FileEncSHA256 string `json:"fileEncSha256,omitempty"` // base64 — hash do blob cifrado
+	FileSHA256    string `json:"fileSha256,omitempty"`    // base64 — hash do arquivo decifrado
+	FileLength    int64  `json:"fileLength,omitempty"`
+	DirectPath    string `json:"directPath,omitempty"`
+	GifPlayback   bool   `json:"gifPlayback,omitempty"` // videoMessage com loop = "gif" no MediaType
 }
 
 // EvolutionInstanceInfo resposta do GET /instance/info/{instanceId}

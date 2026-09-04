@@ -230,19 +230,14 @@ type ChatwootCreateConversationResponse struct {
 	ID int `json:"id"`
 }
 
-// ChatwootAttachmentRequest payload for an attachment
-type ChatwootAttachmentRequest struct {
-	FileName string `json:"file_name"`
-	FileType string `json:"file_type"`
-	DataURL  string `json:"data_url"` // data:image/png;base64,...
-}
-
-// ChatwootCreateMessageRequest payload for creating a message in a conversation
+// ChatwootCreateMessageRequest payload for creating a text message in a
+// conversation (application/json). Anexos não cabem aqui: a API do Chatwoot
+// só aceita anexo via multipart/form-data — ver
+// ChatwootAdminClient.CreateMessageWithAttachment.
 type ChatwootCreateMessageRequest struct {
-	Content     string                      `json:"content"`
-	MessageType string                      `json:"message_type"` // "incoming" or "outgoing"
-	Private     bool                        `json:"private"`
-	Attachments []ChatwootAttachmentRequest `json:"attachments,omitempty"`
+	Content     string `json:"content"`
+	MessageType string `json:"message_type"` // "incoming" or "outgoing"
+	Private     bool   `json:"private"`
 }
 
 // ChatwootCreateMessageResponse response
