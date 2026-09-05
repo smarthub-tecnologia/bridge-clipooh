@@ -72,8 +72,13 @@ func TestDecryptWhatsAppMedia_RoundTrip(t *testing.T) {
 	for _, waMediaType := range []string{"image", "video", "gif", "audio", "document"} {
 		t.Run(waMediaType, func(t *testing.T) {
 			encrypted := encryptWhatsAppMediaForTest(t, plaintext, mediaKey, waMediaType)
+			encSum := sha256.Sum256(encrypted)
+			plainSum := sha256.Sum256(plaintext)
 
-			got, err := decryptWhatsAppMedia(encrypted, mediaKeyB64, waMediaType)
+			got, err := decryptWhatsAppMedia(encrypted, mediaKeyB64, waMediaType,
+				base64.StdEncoding.EncodeToString(encSum[:]),
+				base64.StdEncoding.EncodeToString(plainSum[:]),
+			)
 			if err != nil {
 				t.Fatalf("decryptWhatsAppMedia: %v", err)
 			}
@@ -95,14 +100,53 @@ func TestDecryptWhatsAppMedia_TamperedMACFails(t *testing.T) {
 	tampered := append([]byte{}, encrypted...)
 	tampered[0] ^= 0xFF
 
-	if _, err := decryptWhatsAppMedia(tampered, mediaKeyB64, "image"); err == nil {
+	if _, err := decryptWhatsAppMedia(tampered, mediaKeyB64, "image", "", ""); err == nil {
 		t.Fatal("expected MAC verification to fail for tampered ciphertext, got nil error")
 	}
 }
 
 func TestDecryptWhatsAppMedia_UnsupportedMediaType(t *testing.T) {
-	if _, err := decryptWhatsAppMedia([]byte("irrelevant"), base64.StdEncoding.EncodeToString(make([]byte, 32)), "sticker"); err == nil {
+	if _, err := decryptWhatsAppMedia([]byte("irrelevant"), base64.StdEncoding.EncodeToString(make([]byte, 32)), "sticker", "", ""); err == nil {
 		t.Fatal("expected error for unsupported media type, got nil")
+	}
+}
+
+// TestDecryptWhatsAppMedia_FileEncSHA256Mismatch cobre exatamente o cenário
+// mais provável para "vídeo decifra mas o player rejeita": download
+// truncado/corrompido antes mesmo de tentar decifrar. Com o hash do payload
+// (fileEncSha256) conferido contra o blob baixado, isso agora vira um erro
+// explícito em vez de um arquivo quebrado subindo pro Chatwoot em silêncio.
+func TestDecryptWhatsAppMedia_FileEncSHA256Mismatch(t *testing.T) {
+	plaintext := []byte("some video bytes padded to a couple AES blocks")
+	mediaKey := make([]byte, 32)
+	mediaKeyB64 := base64.StdEncoding.EncodeToString(mediaKey)
+	encrypted := encryptWhatsAppMediaForTest(t, plaintext, mediaKey, "video")
+
+	// Simula download truncado: corta os últimos bytes antes de decifrar.
+	truncated := encrypted[:len(encrypted)-5]
+	fullEncSum := sha256.Sum256(encrypted) // hash do arquivo completo, como viria no payload real
+
+	_, err := decryptWhatsAppMedia(truncated, mediaKeyB64, "video", base64.StdEncoding.EncodeToString(fullEncSum[:]), "")
+	if err == nil {
+		t.Fatal("expected fileEncSha256 mismatch error for truncated download, got nil")
+	}
+}
+
+// TestDecryptWhatsAppMedia_FileSHA256Mismatch cobre o outro lado: ciphertext
+// baixado corretamente (MAC bate, então mediaKey/HKDF info estão certos),
+// mas o resultado decifrado não bate com o hash do arquivo original — sinal
+// de um bug na etapa de decriptação em si, não no download.
+func TestDecryptWhatsAppMedia_FileSHA256Mismatch(t *testing.T) {
+	plaintext := []byte("some video bytes padded to a couple AES blocks")
+	mediaKey := make([]byte, 32)
+	mediaKeyB64 := base64.StdEncoding.EncodeToString(mediaKey)
+	encrypted := encryptWhatsAppMediaForTest(t, plaintext, mediaKey, "video")
+
+	wrongSum := sha256.Sum256([]byte("not the original plaintext"))
+
+	_, err := decryptWhatsAppMedia(encrypted, mediaKeyB64, "video", "", base64.StdEncoding.EncodeToString(wrongSum[:]))
+	if err == nil {
+		t.Fatal("expected fileSha256 mismatch error, got nil")
 	}
 }
 

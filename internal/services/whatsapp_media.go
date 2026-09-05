@@ -1,6 +1,7 @@
 package services
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -32,7 +33,15 @@ var waMediaHKDFInfo = map[string]string{
 // mídia) em 112 bytes — iv (16) + chave AES (32) + chave HMAC (32) + refKey
 // (32, não usado aqui). O blob baixado é AES-256-CBC(iv, chave) + 10 bytes de
 // HMAC-SHA256(iv||ciphertext) truncado, que validamos antes de decifrar.
-func decryptWhatsAppMedia(ciphertext []byte, mediaKeyB64 string, waMediaType string) ([]byte, error) {
+//
+// fileEncSHA256B64/fileSHA256B64 são os hashes que o próprio WhatsApp inclui
+// no payload (fileEncSha256 = SHA-256 do blob cifrado, fileSha256 = SHA-256
+// do arquivo já decifrado) — conferidos aqui contra o que baixamos/produzimos
+// para distinguir, sem ambiguidade, download truncado/corrompido (o
+// primeiro) de um bug na decriptação em si (o segundo), em vez de deixar um
+// arquivo quebrado seguir adiante silenciosamente e só quebrar no player.
+// Vazios (payload sem o campo) pulam a respectiva checagem.
+func decryptWhatsAppMedia(ciphertext []byte, mediaKeyB64, waMediaType, fileEncSHA256B64, fileSHA256B64 string) ([]byte, error) {
 	info, ok := waMediaHKDFInfo[waMediaType]
 	if !ok {
 		return nil, fmt.Errorf("no HKDF info known for media type %q", waMediaType)
@@ -47,6 +56,10 @@ func decryptWhatsAppMedia(ciphertext []byte, mediaKeyB64 string, waMediaType str
 	const macLength = 10
 	if len(ciphertext) <= macLength {
 		return nil, fmt.Errorf("encrypted media too short: %d bytes", len(ciphertext))
+	}
+
+	if err := verifySHA256(ciphertext, fileEncSHA256B64, "downloaded ciphertext doesn't match fileEncSha256 — download is truncated or corrupted"); err != nil {
+		return nil, err
 	}
 
 	expanded := hkdfSHA256(mediaKey, []byte(info), 112)
@@ -75,7 +88,33 @@ func decryptWhatsAppMedia(ciphertext []byte, mediaKeyB64 string, waMediaType str
 	plaintext := make([]byte, len(fileCiphertext))
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plaintext, fileCiphertext)
 
-	return pkcs7Unpad(plaintext)
+	plaintext, err = pkcs7Unpad(plaintext)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := verifySHA256(plaintext, fileSHA256B64, "decrypted output doesn't match fileSha256 — decryption produced the wrong bytes"); err != nil {
+		return nil, err
+	}
+	return plaintext, nil
+}
+
+// verifySHA256 confere data contra um hash SHA-256 em base64 vindo do
+// payload do WhatsApp. hashB64 vazio (campo ausente no payload) pula a
+// checagem em vez de falhar.
+func verifySHA256(data []byte, hashB64, mismatchMsg string) error {
+	if hashB64 == "" {
+		return nil
+	}
+	want, err := base64.StdEncoding.DecodeString(hashB64)
+	if err != nil {
+		return fmt.Errorf("invalid sha256 base64 in payload: %w", err)
+	}
+	got := sha256.Sum256(data)
+	if !bytes.Equal(got[:], want) {
+		return fmt.Errorf("%s (got %d bytes, sha256=%x, want=%x)", mismatchMsg, len(data), got[:], want)
+	}
+	return nil
 }
 
 // hkdfSHA256 implementa HKDF-Extract-and-Expand (RFC 5869) com SHA-256, sem

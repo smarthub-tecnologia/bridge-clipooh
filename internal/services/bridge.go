@@ -442,7 +442,7 @@ func (b *BridgeService) handleIncomingMessage(ctx context.Context, webhook model
 			return err
 		}
 
-		mediaBytes, err = decryptWhatsAppMedia(encryptedBytes, media.MediaKey, info.MediaType)
+		mediaBytes, err = decryptWhatsAppMedia(encryptedBytes, media.MediaKey, info.MediaType, media.FileEncSHA256, media.FileSHA256)
 		if err != nil {
 			logger.Error("failed to decrypt WhatsApp media",
 				zap.String("media_type", info.MediaType),
