@@ -77,27 +77,57 @@ func (b *BridgeService) invalidatePendingQRCycle(instanceName string) {
 	bumpInstanceQREpoch(instanceName)
 }
 
-// ValidateChatwootWebhookSecret valida a assinatura HMAC-SHA256 do webhook Chatwoot
-// contra o secret único fixo da conta (CHATWOOT_WEBHOOK_SECRET) — não há mais
-// lookup por tenant, só existe uma conta Chatwoot.
+// chatwootWebhookInboxRef extrai só o suficiente do payload do webhook pra
+// resolver a instância dona da inbox — account.id + inbox_id (presente tanto
+// em webhook.inbox.id quanto em webhook.conversation.inbox_id, dependendo do
+// evento).
+type chatwootWebhookInboxRef struct {
+	Account struct {
+		ID int `json:"id"`
+	} `json:"account"`
+	Inbox struct {
+		ID int `json:"id"`
+	} `json:"inbox"`
+	Conversation struct {
+		InboxID int `json:"inbox_id"`
+	} `json:"conversation"`
+}
+
+// resolveChatwootWebhookSecret decide qual secret usar pra validar o HMAC
+// deste request: procura em evolution_instances a linha cujo
+// chatwoot_inbox_id bate com o inbox_id do payload e usa o secret dela; se
+// nenhuma instância for encontrada (ou o payload não tiver inbox_id), cai
+// para o CHATWOOT_WEBHOOK_SECRET global — mantém compatibilidade com
+// configs antigas que ainda não têm o secret por-instância preenchido.
+func (b *BridgeService) resolveChatwootWebhookSecret(ctx context.Context, body []byte) (secret string, source string) {
+	globalSecret := strings.TrimSpace(b.chatwoot.WebhookSecret)
+
+	var ref chatwootWebhookInboxRef
+	if err := json.Unmarshal(body, &ref); err != nil {
+		return globalSecret, "global (payload unparseable)"
+	}
+
+	inboxID := ref.Inbox.ID
+	if inboxID == 0 {
+		inboxID = ref.Conversation.InboxID
+	}
+	if inboxID == 0 || b.instanceRepo == nil {
+		return globalSecret, "global (no inbox_id in payload)"
+	}
+
+	instance, err := b.instanceRepo.FindByChatwootInboxID(ctx, inboxID)
+	if err != nil || instance == nil || instance.ChatwootInboxWebhookSecret == nil || strings.TrimSpace(*instance.ChatwootInboxWebhookSecret) == "" {
+		return globalSecret, fmt.Sprintf("global (no instance bound to inbox_id=%d)", inboxID)
+	}
+
+	return strings.TrimSpace(*instance.ChatwootInboxWebhookSecret), fmt.Sprintf("instance %q (inbox_id=%d)", instance.InstanceName, inboxID)
+}
+
+// ValidateChatwootWebhookSecret valida a assinatura HMAC-SHA256 do webhook Chatwoot.
+// O secret é resolvido por instância (evolution_instances.chatwoot_inbox_webhook_secret,
+// via account.id + inbox_id do payload) — CHATWOOT_WEBHOOK_SECRET só entra como
+// fallback quando nenhuma instância corresponde, pra não quebrar configs antigas.
 func (b *BridgeService) ValidateChatwootWebhookSecret(r *nethttp.Request) bool {
-	secret := strings.TrimSpace(b.chatwoot.WebhookSecret)
-	// Se não há segredo configurado, aceita qualquer request
-	if secret == "" {
-		zap.L().Warn("CHATWOOT_WEBHOOK_SECRET not set, accepting request")
-		return true
-	}
-
-	// Log de identidade do segredo (nunca loga o segredo completo)
-	secretPreview := secret
-	if len(secretPreview) >= 6 {
-		secretPreview = secretPreview[:3] + "..." + secretPreview[len(secretPreview)-3:]
-	}
-	zap.L().Info("chatwoot HMAC: secret identity",
-		zap.Int("secret_len", len(secret)),
-		zap.String("secret_preview", secretPreview),
-	)
-
 	// Chatwoot assina o body com HMAC-SHA256 e envia X-Chatwoot-Signature: sha256=<hex>
 	sigHeader := r.Header.Get("X-Chatwoot-Signature")
 	if sigHeader == "" {
@@ -111,6 +141,25 @@ func (b *BridgeService) ValidateChatwootWebhookSecret(r *nethttp.Request) bool {
 	}
 	// Restitui o body para leitura posterior no handler
 	r.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	secret, secretSource := b.resolveChatwootWebhookSecret(r.Context(), body)
+
+	// Se não há segredo configurado (nem por instância, nem global), aceita qualquer request
+	if secret == "" {
+		zap.L().Warn("no chatwoot webhook secret resolved (per-instance or CHATWOOT_WEBHOOK_SECRET), accepting request")
+		return true
+	}
+
+	// Log de identidade do segredo (nunca loga o segredo completo)
+	secretPreview := secret
+	if len(secretPreview) >= 6 {
+		secretPreview = secretPreview[:3] + "..." + secretPreview[len(secretPreview)-3:]
+	}
+	zap.L().Info("chatwoot HMAC: secret identity",
+		zap.String("secret_source", secretSource),
+		zap.Int("secret_len", len(secret)),
+		zap.String("secret_preview", secretPreview),
+	)
 
 	// Log de payload
 	bodyPreview := string(body)
@@ -144,6 +193,7 @@ func (b *BridgeService) ValidateChatwootWebhookSecret(r *nethttp.Request) bool {
 			expPreview = expPreview[:15] + "..."
 		}
 		zap.L().Error("chatwoot HMAC mismatch",
+			zap.String("secret_source", secretSource),
 			zap.String("received_prefix", recvPreview),
 			zap.String("expected_prefix", expPreview),
 			zap.Int("secret_len", len(secret)),
@@ -154,6 +204,8 @@ func (b *BridgeService) ValidateChatwootWebhookSecret(r *nethttp.Request) bool {
 			zap.L().Warn("SKIP_HMAC_VALIDATION=true: bypassing HMAC check (REMOVE IN PRODUCTION)")
 			return true
 		}
+	} else {
+		zap.L().Info("chatwoot HMAC match", zap.String("secret_source", secretSource))
 	}
 	return ok
 }

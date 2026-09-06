@@ -16,6 +16,7 @@ type InstanceRepository interface {
 	CreateTx(ctx context.Context, tx pgx.Tx, i *models.EvolutionInstance) error
 	FindByInstanceID(ctx context.Context, instanceID string) (*models.EvolutionInstance, error)
 	FindByInstanceName(ctx context.Context, instanceName string) (*models.EvolutionInstance, error)
+	FindByChatwootInboxID(ctx context.Context, inboxID int) (*models.EvolutionInstance, error)
 	FindDefault(ctx context.Context) (*models.EvolutionInstance, error)
 	FindAll(ctx context.Context) ([]models.EvolutionInstance, error)
 	UpdateStatus(ctx context.Context, instanceID, status string) error
@@ -105,6 +106,14 @@ func (r *instanceRepo) FindByInstanceID(ctx context.Context, instanceID string) 
 func (r *instanceRepo) FindByInstanceName(ctx context.Context, instanceName string) (*models.EvolutionInstance, error) {
 	query := `SELECT` + instanceSelectFields + ` FROM evolution_instances WHERE instance_name = $1`
 	return scanInstance(r.db.QueryRow(ctx, query, instanceName))
+}
+
+// FindByChatwootInboxID resolve a instância dona de uma inbox Chatwoot pelo
+// chatwoot_inbox_id — usado para validar o HMAC do webhook por instância em
+// vez de contra um secret global único.
+func (r *instanceRepo) FindByChatwootInboxID(ctx context.Context, inboxID int) (*models.EvolutionInstance, error) {
+	query := `SELECT` + instanceSelectFields + ` FROM evolution_instances WHERE chatwoot_inbox_id = $1 AND status <> 'deleted'`
+	return scanInstance(r.db.QueryRow(ctx, query, inboxID))
 }
 
 // FindDefault retorna a instância a usar quando o caller não especifica uma
